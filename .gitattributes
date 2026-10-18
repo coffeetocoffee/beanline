@@ -1,0 +1,11 @@
+# Binary TZif zone files are embedded verbatim via @embedFile; any
+# line-ending conversion corrupts them. Shell scripts must keep LF so
+# they run on Linux/macOS CI runners and containers.
+src/sched/tzdata/** binary
+*.sh text eol=lf
+*.zig text eol=lf
+*.lua text eol=lf
+*.sql text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+Dockerfile text eol=lf

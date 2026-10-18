@@ -1,0 +1,244 @@
+const std = @import("std");
+
+pub const Status = enum {
+    available,
+    scheduled,
+    running,
+    completed,
+    dead,
+    discarded,
+    cancelled,
+
+    pub fn fromSql(s: []const u8) ?Status {
+        const map = [_]struct { []const u8, Status }{
+            .{ "available", .available },
+            .{ "scheduled", .scheduled },
+            .{ "running", .running },
+            .{ "completed", .completed },
+            .{ "dead", .dead },
+            .{ "discarded", .discarded },
+            .{ "cancelled", .cancelled },
+        };
+        for (map) |e| {
+            if (std.mem.eql(u8, e[0], s)) return e[1];
+        }
+        return null;
+    }
+};
+
+pub const EnqueueOptions = struct {
+    queue: []const u8 = "default",
+    priority: u8 = 1,
+    run_at_ms: i64 = 0,
+    max_attempts: u32 = 25,
+    unique_key: ?[]const u8 = null,
+    dedup_run_id: ?[]const u8 = null,
+    tags: []const []const u8 = &.{},
+    context_json: []const u8 = "{}",
+    unique: Unique = .block,
+};
+
+pub const Unique = enum { block, skip, replace, until_complete };
+
+pub const Enqueued = struct {
+    id: i64 = 0,
+    deduped: bool = false,
+    replaced: bool = false,
+};
+
+pub const Claimed = struct {
+    id: i64,
+    queue: []const u8,
+    kind: []const u8,
+    args_json: []const u8,
+    attempts: u32,
+    max_attempts: u32,
+    lease_epoch: u64,
+    priority: u8,
+    run_at_ms: i64,
+    tags: []const []const u8 = &.{},
+    context_json: []const u8 = "{}",
+};
+
+pub const FailOutcome = struct {
+    status: Status = .available,
+    retry_at_ms: i64 = 0,
+    attempts: u32 = 0,
+};
+
+pub const Depth = struct {
+    available: u64 = 0,
+    scheduled: u64 = 0,
+    running: u64 = 0,
+    dead: u64 = 0,
+    completed: u64 = 0,
+    cancelled: u64 = 0,
+    oldest_available_ms: i64 = 0,
+};
+
+pub const Capabilities = struct {
+    transactional_enqueue: bool,
+    pubsub_wakeups: bool,
+    named_backend: []const u8,
+};
+
+/// A job row as surfaced by the read-side query API (dashboard / REST).
+pub const JobRow = struct {
+    id: i64,
+    queue: []const u8,
+    kind: []const u8,
+    args_json: []const u8,
+    status: Status,
+    priority: u8,
+    run_at_ms: i64,
+    attempts: u32,
+    max_attempts: u32,
+    lease_epoch: u64,
+    worker_id: []const u8,
+    inserted_ms: i64,
+    started_ms: i64,
+    finished_ms: i64,
+};
+
+/// A single job event row (audit trail view).
+pub const EventRow = struct {
+    job_id: i64,
+    seq: i64,
+    event_type: []const u8,
+    data_json: []const u8,
+    at_ms: i64,
+};
+
+/// Query filters for job listing.
+pub const JobFilter = struct {
+    queue: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    status: ?Status = null,
+    limit: u32 = 50,
+    offset: u32 = 0,
+};
+
+pub const VTable = struct {
+    enqueue: *const fn (ctx: *anyopaque, kind: []const u8, args_json: []const u8, opts: EnqueueOptions, out: *Enqueued) anyerror!void,
+    claim: *const fn (ctx: *anyopaque, queue: []const u8, limit: u32, worker_id: []const u8, lease_ms: u64, out: []Claimed) anyerror!usize,
+    heartbeat: *const fn (ctx: *anyopaque, queue: []const u8, ids: []const i64, epochs: []const u64, lease_ms: u64) anyerror!void,
+    finish: *const fn (ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64) anyerror!void,
+    fail: *const fn (ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, retryable: bool, retry_at_ms: i64, out: *FailOutcome) anyerror!void,
+    cancel: *const fn (ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: ?u64) anyerror!void,
+    promote: *const fn (ctx: *anyopaque, queues: []const []const u8, limit: u32) anyerror!u32,
+    reap: *const fn (ctx: *anyopaque, queues: []const []const u8, limit: u32) anyerror!u32,
+    depth: *const fn (ctx: *anyopaque, queue: []const u8, out: *Depth) anyerror!void,
+    capabilities: *const fn () Capabilities,
+    deinit: *const fn (ctx: *anyopaque) void,
+    // Optional read-side query API for the dashboard (may be null).
+    list_jobs: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, filter: JobFilter, out: *std.ArrayList(JobRow)) anyerror!void = null,
+    get_job: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, id: i64, out: *?JobRow) anyerror!void = null,
+    job_events: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, id: i64, out: *std.ArrayList(EventRow)) anyerror!void = null,
+    queue_names: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) anyerror!void = null,
+    retry: ?*const fn (ctx: *anyopaque, queue: []const u8, id: i64) anyerror!void = null,
+    discard: ?*const fn (ctx: *anyopaque, queue: []const u8, id: i64) anyerror!void = null,
+};
+
+pub const Broker = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const Batch = struct {
+        max: usize = 16,
+        items: [16]Claimed = undefined,
+
+        pub fn slice(self: *Batch) []Claimed {
+            return self.items[0..self.max];
+        }
+    };
+
+    pub fn enqueue(self: Broker, kind: []const u8, args_json: []const u8, opts: EnqueueOptions, out: *Enqueued) anyerror!void {
+        return self.vtable.enqueue(self.ptr, kind, args_json, opts, out);
+    }
+
+    pub fn claim(self: Broker, queue: []const u8, limit: u32, worker_id: []const u8, lease_ms: u64, out: []Claimed) anyerror!usize {
+        return self.vtable.claim(self.ptr, queue, limit, worker_id, lease_ms, out);
+    }
+
+    pub fn heartbeat(self: Broker, queue: []const u8, ids: []const i64, epochs: []const u64, lease_ms: u64) anyerror!void {
+        return self.vtable.heartbeat(self.ptr, queue, ids, epochs, lease_ms);
+    }
+
+    pub fn finish(self: Broker, queue: []const u8, id: i64, lease_epoch: u64) anyerror!void {
+        return self.vtable.finish(self.ptr, queue, id, lease_epoch);
+    }
+
+    pub fn fail(self: Broker, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, retryable: bool, retry_at_ms: i64, out: *FailOutcome) anyerror!void {
+        return self.vtable.fail(self.ptr, queue, id, lease_epoch, err_name, retryable, retry_at_ms, out);
+    }
+
+    pub fn cancel(self: Broker, queue: []const u8, id: i64, lease_epoch: ?u64) anyerror!void {
+        return self.vtable.cancel(self.ptr, queue, id, lease_epoch);
+    }
+
+    pub fn promote(self: Broker, queues: []const []const u8, limit: u32) anyerror!u32 {
+        return self.vtable.promote(self.ptr, queues, limit);
+    }
+
+    pub fn reap(self: Broker, queues: []const []const u8, limit: u32) anyerror!u32 {
+        return self.vtable.reap(self.ptr, queues, limit);
+    }
+
+    pub fn depth(self: Broker, queue: []const u8, out: *Depth) anyerror!void {
+        return self.vtable.depth(self.ptr, queue, out);
+    }
+
+    pub fn capabilities(self: Broker) Capabilities {
+        return self.vtable.capabilities();
+    }
+
+    pub fn deinit(self: Broker) void {
+        self.vtable.deinit(self.ptr);
+    }
+
+    /// Optional read-side queries; return error.Unsupported when the backend
+    /// does not implement them.
+    pub fn listJobs(self: Broker, alloc: std.mem.Allocator, filter: JobFilter, out: *std.ArrayList(JobRow)) anyerror!void {
+        const f = self.vtable.list_jobs orelse return error.Unsupported;
+        return f(self.ptr, alloc, filter, out);
+    }
+
+    pub fn getJob(self: Broker, alloc: std.mem.Allocator, id: i64, out: *?JobRow) anyerror!void {
+        const f = self.vtable.get_job orelse return error.Unsupported;
+        return f(self.ptr, alloc, id, out);
+    }
+
+    pub fn jobEvents(self: Broker, alloc: std.mem.Allocator, id: i64, out: *std.ArrayList(EventRow)) anyerror!void {
+        const f = self.vtable.job_events orelse return error.Unsupported;
+        return f(self.ptr, alloc, id, out);
+    }
+
+    pub fn queueNames(self: Broker, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) anyerror!void {
+        const f = self.vtable.queue_names orelse return error.Unsupported;
+        return f(self.ptr, alloc, out);
+    }
+
+    pub fn retry(self: Broker, queue: []const u8, id: i64) anyerror!void {
+        const f = self.vtable.retry orelse return error.Unsupported;
+        return f(self.ptr, queue, id);
+    }
+
+    pub fn discard(self: Broker, queue: []const u8, id: i64) anyerror!void {
+        const f = self.vtable.discard orelse return error.Unsupported;
+        return f(self.ptr, queue, id);
+    }
+};
+
+test "status round trip" {
+    for ([_][]const u8{ "available", "scheduled", "running", "completed", "dead", "discarded", "cancelled" }) |s| {
+        const st = Status.fromSql(s).?;
+        try std.testing.expectEqualStrings(s, @tagName(st));
+    }
+    try std.testing.expect(Status.fromSql("bogus") == null);
+}
+
+test "batch slices claimed items" {
+    var b = Broker.Batch{};
+    b.max = 3;
+    try std.testing.expectEqual(@as(usize, 3), b.slice().len);
+}

@@ -1,0 +1,15 @@
+# Zig build outputs
+.zig-cache/
+zig-out/
+dist/
+
+# Local runtime logs
+worker_err.txt
+worker_out.txt
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

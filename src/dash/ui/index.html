@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>beanline dashboard</title>
+<style>
+:root { color-scheme: light dark; --bg: #f6f7f9; --fg: #1a1d21; --card: #fff; --line: #e2e5e9; --accent: #2563eb; --ok: #16a34a; --warn: #d97706; --bad: #dc2626; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0f1216; --fg: #e6e9ee; --card: #171b21; --line: #2a3038; --accent: #60a5fa; } }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--card); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 18px; margin: 0; }
+header h1 small { font-weight: 400; opacity: .6; }
+nav a { margin-right: 12px; color: var(--accent); text-decoration: none; cursor: pointer; }
+nav a.active { font-weight: 700; }
+main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+.card h2 { margin: 0 0 12px; font-size: 16px; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+th { opacity: .7; font-weight: 600; }
+.pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+.available { background: #dbeafe; color: #1d4ed8; }
+.running { background: #fef3c7; color: #92400e; }
+.completed { background: #dcfce7; color: #166534; }
+.dead { background: #fee2e2; color: #991b1b; }
+.scheduled { background: #e0e7ff; color: #3730a3; }
+.cancelled, .discarded { background: #e5e7eb; color: #374151; }
+button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+button.danger { background: var(--bad); }
+button:disabled { opacity: .5; cursor: default; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+input, select, textarea { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); }
+#live { font-family: ui-monospace, monospace; font-size: 12px; max-height: 300px; overflow-y: auto; background: #0b0e12; color: #d1f0d1; padding: 10px; border-radius: 8px; }
+pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+.muted { opacity: .6; }
+#login { max-width: 360px; margin: 80px auto; }
+.hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>beanline <small>queues without the wait</small></h1>
+  <nav>
+    <a data-tab="queues" class="active">queues</a>
+    <a data-tab="jobs">jobs</a>
+    <a data-tab="live">live tail</a>
+    <a data-tab="ops">ops</a>
+  </nav>
+  <span style="flex:1"></span>
+  <span id="who" class="muted"></span>
+  <button id="logout" class="ghost hidden">logout</button>
+</header>
+<main>
+  <div id="login" class="card">
+    <h2>sign in</h2>
+    <div class="row"><input id="user" placeholder="username" autocomplete="username"></div>
+    <div class="row"><input id="pass" type="password" placeholder="password" autocomplete="current-password"></div>
+    <div class="row"><button id="doLogin">sign in</button></div>
+    <!--SSO-->
+    <p class="muted" id="loginErr"></p>
+  </div>
+
+  <section id="tab-queues" class="tab">
+    <div class="card"><h2>queues</h2><div id="queueTable">loading…</div></div>
+    <div class="card"><h2>metrics</h2><div class="row">
+      <a href="/metrics"><button class="ghost">prometheus exposition</button></a>
+      <a href="/healthz"><button class="ghost">healthz</button></a>
+      <a href="/readyz"><button class="ghost">readyz</button></a>
+    </div></div>
+  </section>
+
+  <section id="tab-jobs" class="tab hidden">
+    <div class="card"><h2>jobs</h2>
+      <div class="row">
+        <select id="fStatus"><option value="">any status</option><option>available</option><option>scheduled</option><option>running</option><option>completed</option><option>dead</option><option>cancelled</option><option>discarded</option></select>
+        <input id="fQueue" placeholder="queue">
+        <input id="fKind" placeholder="kind">
+        <button id="doFilter">filter</button>
+      </div>
+      <div id="jobTable">loading…</div>
+    </div>
+    <div class="card hidden" id="detailCard"><h2>job detail</h2><div id="jobDetail"></div></div>
+  </section>
+
+  <section id="tab-live" class="tab hidden">
+    <div class="card"><h2>live tail</h2>
+      <div class="row"><input id="liveQueue" placeholder="queue filter (empty = all)"><button id="liveGo">connect</button><button id="liveStop" class="ghost">stop</button></div>
+      <div id="live"></div>
+    </div>
+  </section>
+
+  <section id="tab-ops" class="tab hidden">
+    <div class="card"><h2>enqueue a job</h2>
+      <div class="row"><input id="eKind" placeholder="kind (e.g. emails.send)" style="min-width:240px"><input id="eQueue" placeholder="queue" value="default"></div>
+      <div class="row"><textarea id="eArgs" rows="3" cols="60" placeholder='args JSON, e.g. {"to":"a","subject":"s"}'>{}</textarea></div>
+      <div class="row"><input id="eUnique" placeholder="unique key (optional)"><button id="doEnqueue">enqueue</button></div>
+      <p class="muted" id="enqueueOut"></p>
+    </div>
+  </section>
+</main>
+<script>
+(function () {
+  "use strict";
+  var csrf = "";
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = opts.headers || {};
+    if (csrf) opts.headers["x-csrf-token"] = csrf;
+    return fetch(path, opts).then(function (r) {
+      if (r.status === 401) { showLogin(); throw new Error("unauthorized"); }
+      return r.json().then(function (j) { return { status: r.status, body: j }; });
+    });
+  }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function showLogin() { document.getElementById("login").classList.remove("hidden"); }
+  function hideLogin() { document.getElementById("login").classList.add("hidden"); }
+
+  document.querySelectorAll("nav a").forEach(function (a) {
+    a.addEventListener("click", function () {
+      document.querySelectorAll("nav a").forEach(function (x) { x.classList.remove("active"); });
+      a.classList.add("active");
+      document.querySelectorAll(".tab").forEach(function (t) { t.classList.add("hidden"); });
+      document.getElementById("tab-" + a.dataset.tab).classList.remove("hidden");
+    });
+  });
+
+  document.getElementById("doLogin").addEventListener("click", function () {
+    var u = document.getElementById("user").value, p = document.getElementById("pass").value;
+    fetch("/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ username: u, password: p }) })
+      .then(function (r) { return r.json().then(function (j) { return { s: r.status, j: j }; }); })
+      .then(function (x) {
+        if (x.s === 200 && x.j.ok) { csrf = x.j.csrf; hideLogin(); document.getElementById("who").textContent = u; document.getElementById("logout").classList.remove("hidden"); loadQueues(); }
+        else document.getElementById("loginErr").textContent = "sign in failed";
+      }).catch(function () { document.getElementById("loginErr").textContent = "sign in failed"; });
+  });
+  document.getElementById("logout").addEventListener("click", function () {
+    fetch("/logout", { method: "POST", headers: { "x-csrf-token": csrf } }).finally(function () { location.reload(); });
+  });
+
+  function loadQueues() {
+    api("/api/queues").then(function (x) {
+      var rows = x.body.queues.map(function (q) {
+        return "<tr><td><b>" + esc(q.name) + "</b></td><td>" + q.available + "</td><td>" + q.scheduled + "</td><td>" + q.running + "</td><td>" + q.dead + "</td><td>" + q.completed + "</td><td>" + (q.oldest_available_ms ? new Date(q.oldest_available_ms).toLocaleString() : "—") + "</td></tr>";
+      }).join("");
+      document.getElementById("queueTable").innerHTML = "<table><tr><th>queue</th><th>available</th><th>scheduled</th><th>running</th><th>dead</th><th>completed</th><th>oldest</th></tr>" + rows + "</table>";
+    }).catch(function () { document.getElementById("queueTable").textContent = "sign in to view queues"; });
+  }
+
+  function loadJobs() {
+    var s = document.getElementById("fStatus").value, q = document.getElementById("fQueue").value, k = document.getElementById("fKind").value;
+    var qs = [];
+    if (s) qs.push("status=" + encodeURIComponent(s));
+    if (q) qs.push("queue=" + encodeURIComponent(q));
+    if (k) qs.push("kind=" + encodeURIComponent(k));
+    api("/api/jobs" + (qs.length ? "?" + qs.join("&") : "")).then(function (x) {
+      var rows = x.body.jobs.map(function (j) {
+        return "<tr><td>" + j.id + "</td><td>" + esc(j.queue) + "</td><td>" + esc(j.kind) + "</td><td><span class='pill " + j.status + "'>" + j.status + "</span></td><td>" + j.attempts + "/" + j.max_attempts + "</td><td><button data-id='" + j.id + "' class='view'>view</button></td></tr>";
+      }).join("");
+      document.getElementById("jobTable").innerHTML = "<table><tr><th>id</th><th>queue</th><th>kind</th><th>status</th><th>attempts</th><th></th></tr>" + rows + "</table>";
+      document.querySelectorAll("button.view").forEach(function (b) {
+        b.addEventListener("click", function () { showJob(b.dataset.id); });
+      });
+    }).catch(function () { document.getElementById("jobTable").textContent = "sign in to view jobs"; });
+  }
+  document.getElementById("doFilter").addEventListener("click", loadJobs);
+
+  function showJob(id) {
+    api("/api/jobs/" + id).then(function (x) {
+      var j = x.body;
+      if (!j.id) { document.getElementById("jobDetail").textContent = "not found"; return; }
+      var ev = (j.events || []).map(function (e) { return "<tr><td>" + e.seq + "</td><td>" + esc(e.type) + "</td><td><pre>" + esc(typeof e.data === "string" ? e.data : JSON.stringify(e.data)) + "</pre></td></tr>"; }).join("");
+      document.getElementById("jobDetail").innerHTML =
+        "<p><b>#" + j.id + "</b> " + esc(j.kind) + " on <b>" + esc(j.queue) + "</b> <span class='pill " + j.status + "'>" + j.status + "</span></p>" +
+        "<p>attempts " + j.attempts + "/" + j.max_attempts + " · epoch " + j.lease_epoch + " · worker " + esc(j.worker_id || "—") + "</p>" +
+        "<p>args</p><pre>" + esc(typeof j.args === "string" ? j.args : JSON.stringify(j.args, null, 2)) + "</pre>" +
+        "<div class='row'><button id='jRetry'>retry</button><button id='jDiscard' class='danger'>discard</button><button id='jCancel' class='ghost'>cancel</button></div>" +
+        "<table><tr><th>seq</th><th>event</th><th>data</th></tr>" + ev + "</table>";
+      document.getElementById("detailCard").classList.remove("hidden");
+      var q = encodeURIComponent(j.queue);
+      document.getElementById("jRetry").addEventListener("click", function () { op("/api/jobs/" + id + "/retry", q); });
+      document.getElementById("jDiscard").addEventListener("click", function () { op("/api/jobs/" + id + "/discard", q); });
+      document.getElementById("jCancel").addEventListener("click", function () { op("/api/jobs/" + id + "/cancel", q); });
+    });
+  }
+  function op(path, q) {
+    api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ queue: decodeURIComponent(q) }) })
+      .then(function () { loadJobs(); showJob(path.split("/")[3]); });
+  }
+
+  document.getElementById("doEnqueue").addEventListener("click", function () {
+    var body = { kind: document.getElementById("eKind").value, queue: document.getElementById("eQueue").value || "default" };
+    try { body.args = JSON.parse(document.getElementById("eArgs").value || "{}"); } catch (e) { document.getElementById("enqueueOut").textContent = "bad args JSON"; return; }
+    var u = document.getElementById("eUnique").value; if (u) body.unique_key = u;
+    api("/api/enqueue", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
+      .then(function (x) { document.getElementById("enqueueOut").textContent = x.body.ok ? "enqueued #" + x.body.id : "deduped #" + x.body.id; });
+  });
+
+  var es = null;
+  document.getElementById("liveGo").addEventListener("click", function () {
+    if (es) es.close();
+    var q = document.getElementById("liveQueue").value;
+    es = new EventSource("/api/live" + (q ? "?queue=" + encodeURIComponent(q) : ""));
+    var box = document.getElementById("live");
+    es.onmessage = function (e) { box.textContent += e.data + "\n"; box.scrollTop = box.scrollHeight; };
+    es.addEventListener("claimed", function (e) { box.textContent += "[claimed] " + e.data + "\n"; box.scrollTop = box.scrollHeight; });
+    es.addEventListener("completed", function (e) { box.textContent += "[completed] " + e.data + "\n"; box.scrollTop = box.scrollHeight; });
+    es.onerror = function () { box.textContent += "— stream closed —\n"; };
+  });
+  document.getElementById("liveStop").addEventListener("click", function () { if (es) es.close(); });
+
+  // Reads are open when the server has no users/keys configured.
+  fetch("/api/queues").then(function (r) {
+    if (r.status === 200) { hideLogin(); loadQueues(); loadJobs(); }
+    else showLogin();
+  }).catch(showLogin);
+  setInterval(function () {
+    if (!document.getElementById("tab-queues").classList.contains("hidden")) loadQueues();
+  }, 5000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+.git
+.github
+.zig-cache
+zig-cache
+zig-out
+docs
+*.md
+!README.md
+worker_out.txt
+worker_err.txt

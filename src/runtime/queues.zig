@@ -1,0 +1,347 @@
+const std = @import("std");
+const broker_mod = @import("../broker/broker.zig");
+const registry_mod = @import("../core/registry.zig");
+const backoff_mod = @import("backoff.zig");
+const errors_mod = @import("../core/errors.zig");
+const pool_mod = @import("pool.zig");
+const limiter_mod = @import("limiter.zig");
+const fairness_mod = @import("fairness.zig");
+const job_mod = @import("../core/job.zig");
+
+const Broker = broker_mod.Broker;
+const Claimed = broker_mod.Claimed;
+const Registry = registry_mod.Registry;
+
+pub const QueueConfig = struct {
+    name: []const u8,
+    concurrency: u32 = 4,
+    weight: u32 = 1,
+    rate_per_s: f64 = 0,
+    lease_ms: u64 = 30_000,
+};
+
+pub const Options = struct {
+    queues: []const QueueConfig,
+    worker_name: []const u8 = "beanline",
+    retry: backoff_mod.Backoff = .{ .base_ms = 1000 },
+    dead_on: []const []const u8 = &.{},
+};
+
+// A claimed job handed to the pool. All bookkeeping happens on the runtime
+// thread ("owner"): pool threads only run the handler.
+pub const Dispatch = struct {
+    owner: *Owner,
+    queue_idx: usize,
+    id: i64,
+    epoch: u64,
+    attempts: u32,
+    args_json: []u8,
+    handler: job_mod.Handle,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    has_err: bool = false,
+    err: anyerror = error.NotRun,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    deadline_ms: i64 = 0,
+    was_stopped: bool = false,
+
+    fn finishOk(self: *Dispatch) void {
+        self.done.store(true, .release);
+    }
+
+    fn finishErr(self: *Dispatch, e: anyerror) void {
+        self.err = e;
+        self.has_err = true;
+        self.done.store(true, .release);
+    }
+
+    fn run(self: *Dispatch) void {
+        const owner = self.owner;
+        var parsed = std.json.parseFromSlice(job_mod.Args, owner.alloc, self.args_json, .{}) catch {
+            self.finishErr(error.BadPayload);
+            return;
+        };
+        defer parsed.deinit();
+        var ctx = job_mod.Context{
+            .job_id = self.id,
+            .lease_epoch = self.epoch,
+            .attempt = @intCast(@min(self.attempts, 255)),
+            .alloc = owner.alloc,
+            .stop_flag = &self.stop,
+            .deadline_ms = self.deadline_ms,
+        };
+        self.handler(&ctx, parsed.value) catch |e| self.finishErr(e);
+        self.was_stopped = ctx.stopped();
+        self.finishOk();
+    }
+
+    fn taskFn(ptr: *anyopaque) void {
+        const self: *Dispatch = @ptrCast(@alignCast(ptr));
+        self.run();
+    }
+};
+
+pub const Owner = struct {
+    alloc: std.mem.Allocator,
+    broker: Broker,
+    reg: *Registry,
+    pool: *pool_mod.Pool,
+    cfgs: []const QueueConfig,
+    worker_name: []const u8,
+    fair: fairness_mod.Scheduler = .{},
+    limiters: []limiter_mod.Limiter = &.{},
+    running: std.ArrayListUnmanaged(*Dispatch) = .{},
+    free_slots: std.ArrayListUnmanaged(usize) = .{},
+    stop: bool = false,
+    next_hb_ms: i64 = 0,
+    policy: errors_mod.RetryPolicy,
+    items: [64]Claimed = undefined,
+
+    pub fn init(alloc: std.mem.Allocator, broker: Broker, reg: *Registry, pool: *pool_mod.Pool, opts: Options) !Owner {
+        const lims = try alloc.alloc(limiter_mod.Limiter, opts.queues.len);
+        for (opts.queues, 0..) |q, i| lims[i] = limiter_mod.Limiter.init(q.rate_per_s, 8, std.time.milliTimestamp());
+        var self = Owner{
+            .alloc = alloc,
+            .broker = broker,
+            .reg = reg,
+            .pool = pool,
+            .cfgs = opts.queues,
+            .worker_name = opts.worker_name,
+            .policy = .{
+                .backoff = opts.retry,
+                .dead_names = opts.dead_on,
+            },
+            .limiters = lims,
+        };
+        var weights: [fairness_mod.MAX_QUEUES]u32 = [_]u32{1} ** fairness_mod.MAX_QUEUES;
+        for (opts.queues, 0..) |q, i| if (q.weight != 0) {
+            weights[i] = q.weight;
+        };
+        self.fair.setWeights(weights[0..opts.queues.len]);
+        return self;
+    }
+
+    pub fn deinit(self: *Owner) void {
+        self.alloc.free(self.limiters);
+        self.free_slots.deinit(self.alloc);
+        self.running.deinit(self.alloc);
+    }
+
+    pub fn inflight(self: *const Owner) usize {
+        return self.running.items.len;
+    }
+
+    pub fn signalStop(self: *Owner) void {
+        self.stop = true;
+    }
+
+    /// Ask a running execution to stop and mark the job cancelled. If the job
+    /// is not inflight it is cancelled at the broker (queued/scheduled jobs).
+    pub fn cancel(self: *Owner, id: i64) !void {
+        var qname: ?[]const u8 = null;
+        var epoch: u64 = 0;
+        for (self.running.items) |d| {
+            if (d.id == id) {
+                qname = self.cfgs[d.queue_idx].name;
+                epoch = d.epoch;
+                d.stop.store(true, .seq_cst);
+                break;
+            }
+        }
+        if (qname) |q| {
+            self.broker.cancel(q, id, epoch) catch |e| {
+                std.log.warn("cancel id={d}: {s}", .{ id, @errorName(e) });
+            };
+        } else {
+            for (self.cfgs) |q| {
+                self.broker.cancel(q.name, id, null) catch continue;
+            }
+        }
+    }
+
+    /// Cooperative timeouts: flip the stop flag on executions past deadline.
+    fn scanTimeouts(self: *Owner, now_ms: i64) void {
+        for (self.running.items) |d| {
+            if (d.deadline_ms != 0 and now_ms > d.deadline_ms and !d.done.load(.acquire)) {
+                d.stop.store(true, .seq_cst);
+            }
+        }
+    }
+
+    // One scheduling round: reap completions, renew leases, fair-claim and
+    // dispatch. Returns the number of jobs claimed this round.
+    pub fn tick(self: *Owner, now_ms: i64) anyerror!usize {
+        try self.processDone();
+        if (now_ms >= self.next_hb_ms) self.heartbeat(now_ms);
+        self.scanTimeouts(now_ms);
+        if (self.stop) return 0;
+
+        self.free_slots.clearRetainingCapacity();
+        for (self.cfgs, 0..) |q, i| {
+            const used = self.countRunning(i);
+            if (q.concurrency > used) try self.free_slots.append(self.alloc, i);
+        }
+        var claimed: usize = 0;
+        var rounds: usize = 0;
+        while (self.free_slots.items.len > 0 and rounds <= self.cfgs.len * 2) : (rounds += 1) {
+            var flags = [_]bool{false} ** fairness_mod.MAX_QUEUES;
+            for (self.free_slots.items) |idx| flags[idx] = true;
+            const qi = (self.fair.pick(&flags) orelse break);
+            const q = self.cfgs[qi];
+            const used = self.countRunning(qi);
+            const used_i: i64 = @intCast(used);
+            const conc_i: i64 = @intCast(q.concurrency);
+            var budget: u32 = @intCast(@max(conc_i - used_i, 0));
+            if (self.limiters[qi].rate_per_s > 0) {
+                const tokens: u32 = @intFromFloat(@max(0, @min(self.limiters[qi].tokens, 100000)));
+                budget = @min(budget, tokens);
+            }
+            if (budget == 0) {
+                if (self.limiters[qi].rate_per_s > 0 and used < q.concurrency) {
+                    // rate limited: skip this round entirely
+                    return claimed;
+                }
+                self.removeSlot(qi);
+                continue;
+            }
+            if (budget > self.items.len) budget = @intCast(self.items.len);
+            const n = try self.broker.claim(q.name, budget, self.worker_name, q.lease_ms, self.items[0..budget]);
+            for (self.items[0..n]) |c| {
+                _ = self.limiters[qi].tryAcquire(now_ms);
+                try self.dispatchOrUpdate(c, qi, now_ms);
+            }
+            claimed += n;
+            if (n < budget) self.removeSlot(qi); // queue drained; fairness moves on
+        }
+        return claimed;
+    }
+
+    fn dispatchOrUpdate(self: *Owner, c: Claimed, qi: usize, now_ms: i64) anyerror!void {
+        const j = self.reg.get(c.kind) orelse {
+            // Unknown kind: never retry, straight to dead.
+            var out = broker_mod.FailOutcome{};
+            self.broker.fail(self.cfgs[qi].name, c.id, c.lease_epoch, "unknown_kind", false, 0, &out) catch |e| {
+                std.log.warn("unknown_kind fail id={d}: {s}", .{ c.id, @errorName(e) });
+            };
+            return;
+        };
+        const d = try self.alloc.create(Dispatch);
+        d.* = .{
+            .owner = self,
+            .queue_idx = qi,
+            .id = c.id,
+            .epoch = c.lease_epoch,
+            .attempts = c.attempts,
+            .args_json = try self.alloc.dupe(u8, c.args_json),
+            .handler = j.handle,
+            .deadline_ms = if (j.timeout_ms == 0) 0 else now_ms + @as(i64, @intCast(j.timeout_ms)),
+        };
+        try self.pool.submit(.{ .ptr = d, .run = Dispatch.taskFn });
+        try self.running.append(self.alloc, d);
+    }
+
+    fn processDone(self: *Owner) anyerror!void {
+        if (self.running.items.len == 0) return;
+        var i: usize = 0;
+        while (i < self.running.items.len) {
+            const d = self.running.items[i];
+            if (!d.done.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            const qname = self.cfgs[d.queue_idx].name;
+            const stopped = d.stop.load(.acquire) or d.was_stopped;
+            if (!d.has_err and stopped) {
+                // Cancelled/timeout: mark cancelled instead of completed.
+                self.broker.cancel(qname, d.id, d.epoch) catch |e| {
+                    std.log.warn("cancel on stop id={d}: {s}", .{ d.id, @errorName(e) });
+                };
+            } else if (!d.has_err) {
+                self.broker.finish(qname, d.id, d.epoch) catch |e| {
+                    // Lease was taken over or job got cancelled: log and drop.
+                    std.log.warn("fencing: finish id={d} epoch={d} got {s}", .{ d.id, d.epoch, @errorName(e) });
+                };
+            } else {
+                try self.reportFailure(d, qname);
+            }
+            self.alloc.free(d.args_json);
+            self.alloc.destroy(d);
+            _ = self.running.swapRemove(i);
+        }
+    }
+
+    fn reportFailure(self: *Owner, d: *Dispatch, qname: []const u8) !void {
+        const err_name = @errorName(d.err);
+        var out = broker_mod.FailOutcome{};
+        if (std.mem.eql(u8, err_name, "UnknownKind")) {
+            self.broker.fail(qname, d.id, d.epoch, "unknown_kind", false, 0, &out) catch |e| {
+                std.log.warn("fail id={d}: {s}", .{ d.id, @errorName(e) });
+            };
+            return;
+        }
+        const cls = self.policy.classOf(err_name);
+        var retry_at: i64 = 0;
+        if (cls == .retryable) {
+            var prng = std.Random.DefaultPrng.init(@bitCast(@as(u64, @intCast(d.id)) ^ (@as(u64, d.attempts) << 8)));
+            const delay = self.policy.backoff.delayMs(d.attempts + 1, 0, prng.random());
+            retry_at = std.time.milliTimestamp() + @as(i64, @intCast(delay));
+        }
+        self.broker.fail(qname, d.id, d.epoch, err_name, cls == .retryable, retry_at, &out) catch |e| {
+            std.log.warn("fail id={d}: {s}", .{ d.id, @errorName(e) });
+        };
+    }
+
+    fn heartbeat(self: *Owner, now_ms: i64) void {
+        if (self.cfgs.len == 0) return;
+        const interval = @max(self.cfgs[0].lease_ms / 3, 250);
+        self.next_hb_ms = now_ms + @as(i64, @intCast(interval));
+        if (self.running.items.len == 0) return;
+        for (self.cfgs, 0..) |q, qi| {
+            var ids: std.ArrayListUnmanaged(i64) = .{};
+            var eps: std.ArrayListUnmanaged(u64) = .{};
+            defer ids.deinit(self.alloc);
+            defer eps.deinit(self.alloc);
+            for (self.running.items) |d| {
+                if (d.queue_idx == qi) {
+                    ids.append(self.alloc, d.id) catch return;
+                    eps.append(self.alloc, d.epoch) catch return;
+                }
+            }
+            if (ids.items.len == 0) continue;
+            self.broker.heartbeat(q.name, ids.items, eps.items, q.lease_ms) catch |e| {
+                std.log.warn("heartbeat queue={s}: {s}", .{ q.name, @errorName(e) });
+            };
+        }
+    }
+
+    fn countRunning(self: *Owner, qi: usize) usize {
+        var n: usize = 0;
+        for (self.running.items) |d| {
+            if (d.queue_idx == qi and !d.done.load(.acquire)) n += 1;
+        }
+        return n;
+    }
+
+    fn removeSlot(self: *Owner, idx: usize) void {
+        for (self.free_slots.items, 0..) |v, k| {
+            if (v == idx) {
+                _ = self.free_slots.swapRemove(k);
+                return;
+            }
+        }
+    }
+};
+
+test "fairness pick with refreshed slots" {
+    var o = Owner{
+        .alloc = undefined,
+        .broker = undefined,
+        .reg = undefined,
+        .pool = undefined,
+        .cfgs = &.{},
+        .worker_name = "",
+        .policy = .{},
+    };
+    o.fair.setWeights(&[_]u32{ 1, 1 });
+    var flags = [_]bool{ true, false };
+    try std.testing.expectEqual(@as(?usize, 0), o.fair.pick(&flags));
+}

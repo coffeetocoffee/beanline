@@ -1,0 +1,68 @@
+# Local development stack: one Postgres, one Redis, a worker tier and a
+# dashboard tier. Everything here is throwaway; point BEANLINE_DATABASE_URL
+# at your own database in production.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: beanline
+      POSTGRES_PASSWORD: beanline
+      POSTGRES_DB: beanline
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beanline"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    command: ["migrate"]
+    environment:
+      BEANLINE_DATABASE_URL: postgres://beanline:beanline@postgres:5432/beanline
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["worker"]
+    environment:
+      BEANLINE_DATABASE_URL: postgres://beanline:beanline@postgres:5432/beanline
+      BEANLINE_QUEUES: "default:4;mailers:2"
+      BEANLINE_LEASE_MS: "30000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 2
+
+  server:
+    build: .
+    command: ["server"]
+    environment:
+      BEANLINE_DATABASE_URL: postgres://beanline:beanline@postgres:5432/beanline
+      BEANLINE_DASH_BIND: "0.0.0.0:9484"
+      BEANLINE_DASH_USERS: "ops:change-me:admin"
+    ports:
+      - "9484:9484"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
