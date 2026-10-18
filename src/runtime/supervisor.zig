@@ -37,7 +37,7 @@ fn installSignals() void {
     } else {
         const act = std.posix.Sigaction{
             .handler = .{ .handler = onSig },
-            .mask = std.posix.sigemptyset(),
+            .mask = std.posix.empty_sigset,
             .flags = 0,
         };
         std.posix.sigaction(std.posix.SIG.INT, &act, null);
