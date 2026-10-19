@@ -40,27 +40,35 @@ jobs:
         run: zig fmt --check src tests build.zig
       - name: build
         run: zig build -Doptimize=ReleaseSafe
-      # Each test command is its own step on purpose. They used to share one
-      # `run:` block, which made a hang ambiguous in the logs: the step simply
-      # stopped producing output, and there was no way to tell which of the
-      # three commands was stuck. As separate steps the runner reports the
-      # exact command that never returned.
+      # Test execution deliberately avoids `zig build test` on this matrix.
+      #
+      # Evidence: every step that ran a test binary *directly* passed on
+      # macos-14 in about ten seconds, while every step that ran one *through
+      # the Zig build runner* stalled with no output until the job was
+      # cancelled at 25 minutes. Across three runs the stall moved between
+      # `zig build test` and `zig build test-fuzz` as the build graph changed,
+      # which ruled out the test code and pointed at the runner itself. The
+      # same `zig build test-fuzz` invocation takes 6s on ubuntu-latest and
+      # hangs on macos-14 with the identical Zig 0.14.1 and the identical
+      # tests, so this is a Zig 0.14.1 build-runner fault on macOS arm64, not
+      # a defect in this repository. This runner image already forced a
+      # macos-14 pin for a Zig linker/SDK problem (see the matrix comment).
+      #
+      # The build runner is still used to *compile* the test binaries; only
+      # the running of them is done directly, which is the operation that
+      # hangs. Coverage is unchanged: both suites run and both must pass.
       - name: install unit test binary
         shell: bash
         run: zig build test-unit-probe
-      - name: test unit suite (streams per-test output)
+      - name: install fuzz test binary
+        shell: bash
+        run: zig build test-fuzz-install
+      - name: test unit suite
         # Runs the binary directly so per-test `N/M name...OK` lines stream to
-        # the log; on a hang the last line names the culprit. This duplicates
-        # coverage the `test` gate step below also has, and exists purely as a
-        # diagnostic.
-        #
-        # Guarded by an explicit watchdog rather than relying on the job-level
-        # timeout-minutes: when this hung on macos-14 the job just sat silent
-        # for 25 minutes and the only clue was the runner's orphan-process
-        # reaper. `timeout` is not on macOS by default (coreutils), so use the
-        # shell's own job control, which is available in bash on all three
-        # runners. On expiry the `sample`/`procdump` fallback is best-effort and
-        # must never fail the step.
+        # the log. Watchdog-guarded so a future hang fails in five minutes
+        # with the culprit named, instead of burning the whole job timeout.
+        # GNU `timeout` is absent on macOS, so this uses bash job control,
+        # which is available in bash on all three runners.
         shell: bash
         run: |
           set -m
@@ -71,14 +79,15 @@ jobs:
           kill "$WATCHDOG_PID" 2>/dev/null || true
           exit $STATUS
       - name: test fuzz target unit tests
-        # Split out from the gate below: `zig build test` depends on both this
-        # and the library suite, and on macos-14 it produced no output at all
-        # for 24 minutes, which did not say which of the two was stuck.
         shell: bash
-        run: zig build test-fuzz --summary all
-      - name: test (gate)
-        shell: bash
-        run: zig build test --summary all
+        run: |
+          set -m
+          ./zig-out/bin/test-fuzz-tests & TEST_PID=$!
+          ( sleep 300; kill -QUIT "$TEST_PID" 2>/dev/null; kill -TERM "$TEST_PID" 2>/dev/null ) &
+          WATCHDOG_PID=$!
+          wait "$TEST_PID"; STATUS=$?
+          kill "$WATCHDOG_PID" 2>/dev/null || true
+          exit $STATUS
 
   fuzz:
     name: fuzz gate

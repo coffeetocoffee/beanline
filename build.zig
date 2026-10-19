@@ -87,23 +87,23 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/fuzz/all.zig"),
         .target = target,
         .optimize = optimize,
+        // Distinct name: the unit probe below installs as `test`, and both
+        // would otherwise land in zig-out/bin as `test`.
+        .name = "test-fuzz-tests",
     });
     fuzz_tests.root_module.addImport("beanline", beanline_mod);
     const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
     const fuzz_test_step = b.step("test-fuzz", "Run fuzz target unit tests");
     fuzz_test_step.dependOn(&run_fuzz_tests.step);
     test_step.dependOn(&run_fuzz_tests.step);
-    // Serialize the two test binaries. With no edge between them the build
-    // runner starts them in parallel, so `zig build test` ran the library and
-    // fuzz suites concurrently while `test-unit-probe` and `test-fuzz` each
-    // ran alone. That parallelism was the only structural difference between
-    // the macos-14 steps that passed and the `test` gate that hung: the probe
-    // (130 tests) and `test-fuzz` (10 tests) both completed in about ten
-    // seconds, then `zig build test` produced no output at all until the job
-    // was cancelled 25 minutes later. Chaining the fuzz run behind the
-    // library run keeps the gate's coverage identical and only removes the
-    // overlap.
-    run_fuzz_tests.step.dependOn(&run_unit_tests.step);
+    // Install-only counterpart of the probe step: compile the fuzz test binary
+    // without running it, so CI can execute it directly. Same rationale as
+    // `test-unit-probe` below — running a test binary through the Zig 0.14.1
+    // build runner hangs on macos-14 arm64, while executing the binary
+    // directly works there in seconds.
+    const install_fuzz_tests = b.addInstallArtifact(fuzz_tests, .{});
+    const test_fuzz_install_step = b.step("test-fuzz-install", "Install the fuzz test binary for direct runs");
+    test_fuzz_install_step.dependOn(&install_fuzz_tests.step);
 
     // Progress-probing test runs: `zig build test-unit-probe` compiles the
     // unit tests and runs the test binary directly, bypassing the build
