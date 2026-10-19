@@ -37,7 +37,9 @@ jobs:
       - name: build
         run: zig build -Doptimize=ReleaseSafe
       - name: test
-        run: zig build test --summary all
+        # timeout: a hung test must fail the job, not burn the 6h runner
+        # budget (a stuck accept()/sleep loop once did exactly that).
+        run: timeout 20m zig build test --summary all
 
   fuzz:
     name: fuzz gate
@@ -96,15 +98,17 @@ jobs:
         if: matrix.backend == 'postgres'
         env:
           BEANLINE_DATABASE_URL: postgres://beanline:beanline@localhost:5432/beanline
+        # timeout: 30s duration + 5s warmup plus migrate/claim overhead;
+        # 10m means a wedged bench fails instead of burning runner hours.
         run: |
-          ./zig-out/bin/beanline bench --workload noop --duration 30 --warmup 5 \
+          timeout 10m ./zig-out/bin/beanline bench --workload noop --duration 30 --warmup 5 \
             --workers 8 --queues 2 --report bench-report-postgres.json
       - name: bench (redis)
         if: matrix.backend == 'redis'
         env:
           BEANLINE_REDIS_URL: redis://localhost:6379
         run: |
-          ./zig-out/bin/beanline bench --workload noop --duration 30 --warmup 5 \
+          timeout 10m ./zig-out/bin/beanline bench --workload noop --duration 30 --warmup 5 \
             --workers 8 --queues 2 --report bench-report-redis.json
       - name: gate against the reference
         if: github.event_name == 'schedule'

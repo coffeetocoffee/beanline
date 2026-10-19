@@ -144,6 +144,12 @@ const Pg = struct {
     alloc: std.mem.Allocator,
     c: pg.Conn,
     claim: ?pg.Rows = null,
+    /// Serializes all connection use. The Postgres wire protocol is strictly
+    /// request/response on one stream, and several operations pair BEGIN with
+    /// COMMIT, so concurrent use from multiple threads corrupts the frame
+    /// stream. Lock at the vtable entry points below (the *Impl helpers call
+    /// each other; locking inside them would self-deadlock).
+    mu: std.Thread.Mutex = .{},
 
     fn rollback(self: *Pg) void {
         self.c.execSimple("ROLLBACK") catch {};
@@ -466,46 +472,64 @@ const Pg = struct {
 
 fn enqueueCb(ctx: *anyopaque, kind: []const u8, args_json: []const u8, opts: b.EnqueueOptions, out: *b.Enqueued) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try self.enqueueImpl(kind, args_json, opts, out);
 }
 
 fn claimCb(ctx: *anyopaque, queue: []const u8, limit: u32, worker_id: []const u8, lease_ms: u64, out: []b.Claimed) anyerror!usize {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     return try self.claimImpl(queue, limit, worker_id, lease_ms, out);
 }
 
 fn heartbeatCb(ctx: *anyopaque, queue: []const u8, ids: []const i64, epochs: []const u64, lease_ms: u64) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try self.heartbeatImpl(queue, ids, epochs, lease_ms);
 }
 
 fn finishCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try self.finishImpl(queue, id, lease_epoch);
 }
 
 fn failCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, retryable: bool, retry_at_ms: i64, out: *b.FailOutcome) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try self.failImpl(queue, id, lease_epoch, err_name, retryable, retry_at_ms, out);
 }
 
 fn cancelCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: ?u64) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try self.cancelImpl(queue, id, lease_epoch);
 }
 
 fn promoteCb(ctx: *anyopaque, queues: []const []const u8, limit: u32) anyerror!u32 {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     return try self.promoteImpl(queues, limit);
 }
 
 fn reapCb(ctx: *anyopaque, queues: []const []const u8, limit: u32) anyerror!u32 {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     return try self.reapImpl(queues, limit);
 }
 
 fn depthCb(ctx: *anyopaque, queue: []const u8, out: *b.Depth) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try self.depthImpl(queue, out);
 }
 
@@ -680,31 +704,43 @@ fn discardImpl(self: *Pg, queue: []const u8, id: i64) !void {
 
 fn listJobsCb(ctx: *anyopaque, alloc: std.mem.Allocator, filter: b.JobFilter, out: *std.ArrayList(b.JobRow)) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try listJobsImpl(self, alloc, filter, out);
 }
 
 fn getJobCb(ctx: *anyopaque, alloc: std.mem.Allocator, id: i64, out: *?b.JobRow) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try getJobImpl(self, alloc, id, out);
 }
 
 fn jobEventsCb(ctx: *anyopaque, alloc: std.mem.Allocator, id: i64, out: *std.ArrayList(b.EventRow)) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try jobEventsImpl(self, alloc, id, out);
 }
 
 fn queueNamesCb(ctx: *anyopaque, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try queueNamesImpl(self, alloc, out);
 }
 
 fn retryCb(ctx: *anyopaque, queue: []const u8, id: i64) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try retryImpl(self, queue, id);
 }
 
 fn discardCb(ctx: *anyopaque, queue: []const u8, id: i64) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
     try discardImpl(self, queue, id);
 }
 

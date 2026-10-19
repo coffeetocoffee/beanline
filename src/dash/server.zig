@@ -85,27 +85,40 @@ pub const Server = struct {
 
     pub fn stopServer(self: *Server) void {
         self.stop.store(true, .seq_cst);
-        // Wake the accept loop by connecting to ourselves.
+        // Wake the accept loop by connecting to ourselves, then join before
+        // closing the listener: on some platforms (notably macOS) close() does
+        // not reliably unblock a thread parked in accept(), so the self-connect
+        // must be what wakes it, and the socket must still be open for the
+        // accept thread to finish draining it.
         if (self.net_server) |*srv| {
             const addr = srv.listen_address;
             const c = std.net.tcpConnectToAddress(addr) catch null;
             if (c) |conn| conn.close();
-            srv.deinit();
-            self.net_server = null;
         }
         if (self.thread) |th| {
             th.join();
             self.thread = null;
         }
+        if (self.net_server) |*srv| {
+            srv.deinit();
+            self.net_server = null;
+        }
     }
 
     fn acceptLoop(self: *Server) void {
         if (self.net_server == null) return;
+        const srv = &self.net_server.?;
         while (!self.stop.load(.seq_cst)) {
-            const conn = self.net_server.?.accept() catch {
+            const conn = srv.accept() catch {
                 if (self.stop.load(.seq_cst)) return;
                 continue;
             };
+            // The stopServer() self-connect wakeup arrives here: drop it
+            // without blocking on an HTTP head that will never come.
+            if (self.stop.load(.seq_cst)) {
+                conn.stream.close();
+                return;
+            }
             self.handleConn(conn) catch {};
         }
     }
