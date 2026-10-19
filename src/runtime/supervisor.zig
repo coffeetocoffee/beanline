@@ -229,7 +229,7 @@ pub const App = struct {
                     br.depth(c.name, &d) catch {
                         continue;
                     };
-                    self.metrics.setQueueDepth(c.name, @intCast(d.available), @intCast(d.scheduled), @intCast(d.running), @intCast(d.dead));
+                    self.metrics.setQueueDepthFull(c.name, @intCast(d.available), @intCast(d.scheduled), @intCast(d.running), @intCast(d.dead), @intCast(d.completed), @intCast(d.cancelled));
                 }
             }
             std.time.sleep(if (owner.inflight() == 0) 20 else 5);
@@ -294,7 +294,7 @@ pub const App = struct {
             var d = broker_mod.Depth{};
             for (self.queue_names.items) |q| {
                 br.depth(q, &d) catch continue;
-                self.metrics.setQueueDepth(q, @intCast(d.available), @intCast(d.scheduled), @intCast(d.running), @intCast(d.dead));
+                self.metrics.setQueueDepthFull(q, @intCast(d.available), @intCast(d.scheduled), @intCast(d.running), @intCast(d.dead), @intCast(d.completed), @intCast(d.cancelled));
             }
         }
         return 0;

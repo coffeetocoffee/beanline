@@ -25,6 +25,8 @@ pub const Metrics = struct {
     depth_scheduled: std.ArrayList(std.atomic.Value(i64)),
     depth_running: std.ArrayList(std.atomic.Value(i64)),
     depth_dead: std.ArrayList(std.atomic.Value(i64)),
+    depth_completed: std.ArrayList(std.atomic.Value(i64)),
+    depth_cancelled: std.ArrayList(std.atomic.Value(i64)),
 
     claim_duration_us_total: std.atomic.Value(u64),
     claim_duration_us_count: std.atomic.Value(u64),
@@ -53,6 +55,8 @@ pub const Metrics = struct {
             .depth_scheduled = std.ArrayList(std.atomic.Value(i64)).init(alloc),
             .depth_running = std.ArrayList(std.atomic.Value(i64)).init(alloc),
             .depth_dead = std.ArrayList(std.atomic.Value(i64)).init(alloc),
+            .depth_completed = std.ArrayList(std.atomic.Value(i64)).init(alloc),
+            .depth_cancelled = std.ArrayList(std.atomic.Value(i64)).init(alloc),
             .claim_duration_us_total = std.atomic.Value(u64).init(0),
             .claim_duration_us_count = std.atomic.Value(u64).init(0),
             .scheduler_skipped = std.atomic.Value(u64).init(0),
@@ -77,6 +81,8 @@ pub const Metrics = struct {
         self.depth_scheduled.deinit();
         self.depth_running.deinit();
         self.depth_dead.deinit();
+        self.depth_completed.deinit();
+        self.depth_cancelled.deinit();
     }
 
     fn internKind(self: *Metrics, name: []const u8) !u16 {
@@ -110,6 +116,8 @@ pub const Metrics = struct {
         try self.depth_scheduled.append(std.atomic.Value(i64).init(0));
         try self.depth_running.append(std.atomic.Value(i64).init(0));
         try self.depth_dead.append(std.atomic.Value(i64).init(0));
+        try self.depth_completed.append(std.atomic.Value(i64).init(0));
+        try self.depth_cancelled.append(std.atomic.Value(i64).init(0));
         try self.queue_ids.put(owned, id);
         return id;
     }
@@ -142,11 +150,17 @@ pub const Metrics = struct {
     }
 
     pub fn setQueueDepth(self: *Metrics, queue: []const u8, available: i64, scheduled: i64, running: i64, dead: i64) void {
+        self.setQueueDepthFull(queue, available, scheduled, running, dead, 0, 0);
+    }
+
+    pub fn setQueueDepthFull(self: *Metrics, queue: []const u8, available: i64, scheduled: i64, running: i64, dead: i64, completed: i64, cancelled: i64) void {
         const q = self.internQueue(queue) catch return;
         self.depth_available.items[q].store(available, .monotonic);
         self.depth_scheduled.items[q].store(scheduled, .monotonic);
         self.depth_running.items[q].store(running, .monotonic);
         self.depth_dead.items[q].store(dead, .monotonic);
+        self.depth_completed.items[q].store(completed, .monotonic);
+        self.depth_cancelled.items[q].store(cancelled, .monotonic);
     }
 
     pub fn observeClaim(self: *Metrics, elapsed_us: u64) void {
@@ -216,6 +230,12 @@ pub const Metrics = struct {
         }
         for (self.queue_names.items, 0..) |q, i| {
             try w.print("beanline_queue_depth{{queue=\"{s}\",state=\"dead\"}} {d}\n", .{ q, self.depth_dead.items[i].load(.monotonic) });
+        }
+        for (self.queue_names.items, 0..) |q, i| {
+            try w.print("beanline_queue_depth{{queue=\"{s}\",state=\"completed\"}} {d}\n", .{ q, self.depth_completed.items[i].load(.monotonic) });
+        }
+        for (self.queue_names.items, 0..) |q, i| {
+            try w.print("beanline_queue_depth{{queue=\"{s}\",state=\"cancelled\"}} {d}\n", .{ q, self.depth_cancelled.items[i].load(.monotonic) });
         }
 
         try w.writeAll("# HELP beanline_claim_duration_seconds Job claim duration.\n");
