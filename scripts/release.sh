@@ -38,7 +38,7 @@ build x86_64-windows       windows-x86_64
 # SBOM for the linux artifact, generated from the binary that is shipped.
 mkdir -p "$OUT/sbom"
 zig build -Doptimize="$OPTIMIZE" -Dtarget=x86_64-linux-musl --prefix "$OUT/sbom"
-./scripts/sbom.sh "$OUT/sbom/bin/beanline" "$OUT/beanline.sbom.json" "$VERSION"
+bash scripts/sbom.sh "$OUT/sbom/bin/beanline" "$OUT/beanline.sbom.json" "$VERSION"
 
 cp Dockerfile README.md LICENSE "$OUT/" 2>/dev/null || true
 
