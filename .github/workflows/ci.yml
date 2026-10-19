@@ -177,6 +177,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-test, fuzz]
     runs-on: ubuntu-latest
+    # checkout needs contents:read; the ghcr.io image push needs
+    # packages:write (the workflow-level grant is read-only).
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
