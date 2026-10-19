@@ -93,6 +93,17 @@ pub fn build(b: *std.Build) void {
     const fuzz_test_step = b.step("test-fuzz", "Run fuzz target unit tests");
     fuzz_test_step.dependOn(&run_fuzz_tests.step);
     test_step.dependOn(&run_fuzz_tests.step);
+    // Serialize the two test binaries. With no edge between them the build
+    // runner starts them in parallel, so `zig build test` ran the library and
+    // fuzz suites concurrently while `test-unit-probe` and `test-fuzz` each
+    // ran alone. That parallelism was the only structural difference between
+    // the macos-14 steps that passed and the `test` gate that hung: the probe
+    // (130 tests) and `test-fuzz` (10 tests) both completed in about ten
+    // seconds, then `zig build test` produced no output at all until the job
+    // was cancelled 25 minutes later. Chaining the fuzz run behind the
+    // library run keeps the gate's coverage identical and only removes the
+    // overlap.
+    run_fuzz_tests.step.dependOn(&run_unit_tests.step);
 
     // Progress-probing test runs: `zig build test-unit-probe` compiles the
     // unit tests and runs the test binary directly, bypassing the build
