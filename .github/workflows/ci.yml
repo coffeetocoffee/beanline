@@ -70,6 +70,12 @@ jobs:
           wait "$TEST_PID"; STATUS=$?
           kill "$WATCHDOG_PID" 2>/dev/null || true
           exit $STATUS
+      - name: test fuzz target unit tests
+        # Split out from the gate below: `zig build test` depends on both this
+        # and the library suite, and on macos-14 it produced no output at all
+        # for 24 minutes, which did not say which of the two was stuck.
+        shell: bash
+        run: zig build test-fuzz --summary all
       - name: test (gate)
         shell: bash
         run: zig build test --summary all
