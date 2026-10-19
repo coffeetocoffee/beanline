@@ -41,7 +41,16 @@ jobs:
       - name: build
         run: zig build -Doptimize=ReleaseSafe
       - name: test
-        run: zig build test --summary all
+        # The probe runs the test binary directly so per-test `N/M name...OK`
+        # lines stream to the log; on a hang the last line names the culprit.
+        # `test` stays the gate and runs second for the summary counts.
+        # bash on all three OSes (Windows defaults to PowerShell, where the
+        # executable-suffix fallback below would not parse).
+        shell: bash
+        run: |
+          zig build test-unit-probe
+          ./zig-out/bin/test || ./zig-out/bin/test.exe
+          zig build test --summary all
 
   fuzz:
     name: fuzz gate
