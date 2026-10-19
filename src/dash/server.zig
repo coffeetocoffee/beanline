@@ -84,17 +84,10 @@ pub const Server = struct {
     }
 
     pub fn stopServer(self: *Server) void {
+        // The accept loop polls its listener on a short timeout and re-checks
+        // `stop`, so all this needs to do is raise the flag and join. Closing
+        // the listener first would race the loop's own accept().
         self.stop.store(true, .seq_cst);
-        // Wake the accept loop by connecting to ourselves, then join before
-        // closing the listener: on some platforms (notably macOS) close() does
-        // not reliably unblock a thread parked in accept(), so the self-connect
-        // must be what wakes it, and the socket must still be open for the
-        // accept thread to finish draining it.
-        if (self.net_server) |*srv| {
-            const addr = srv.listen_address;
-            const c = std.net.tcpConnectToAddress(addr) catch null;
-            if (c) |conn| conn.close();
-        }
         if (self.thread) |th| {
             th.join();
             self.thread = null;
@@ -108,13 +101,33 @@ pub const Server = struct {
     fn acceptLoop(self: *Server) void {
         if (self.net_server == null) return;
         const srv = &self.net_server.?;
+        // Poll before accepting instead of blocking in accept(). close() does
+        // not reliably wake a thread parked in accept() on every platform
+        // (macOS in particular), and the previous self-connect wakeup was
+        // racy: whenever the loop was busy handling a connection rather than
+        // parked in accept(), the wakeup sat unread in the backlog and the
+        // join depended on the connection happening to drain first. A bounded
+        // poll makes shutdown deterministic everywhere, at the cost of one
+        // poll syscall per idle tick.
+        var fds = [_]std.posix.pollfd{.{
+            .fd = srv.stream.handle,
+            .events = std.posix.POLL.IN,
+            .revents = undefined,
+        }};
         while (!self.stop.load(.seq_cst)) {
+            // A failed poll is not worth distinguishing: the stop flag below
+            // decides whether to keep going, and the error sets differ per
+            // platform (EINTR on posix, nothing extra on Windows).
+            const ready = std.posix.poll(&fds, 100) catch {
+                if (self.stop.load(.seq_cst)) return;
+                continue;
+            };
+            if (ready == 0) continue;
+            if (fds[0].revents & std.posix.POLL.IN == 0) continue;
             const conn = srv.accept() catch {
                 if (self.stop.load(.seq_cst)) return;
                 continue;
             };
-            // The stopServer() self-connect wakeup arrives here: drop it
-            // without blocking on an HTTP head that will never come.
             if (self.stop.load(.seq_cst)) {
                 conn.stream.close();
                 return;
