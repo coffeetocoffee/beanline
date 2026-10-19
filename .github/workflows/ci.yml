@@ -40,17 +40,39 @@ jobs:
         run: zig fmt --check src tests build.zig
       - name: build
         run: zig build -Doptimize=ReleaseSafe
-      - name: test
-        # The probe runs the test binary directly so per-test `N/M name...OK`
-        # lines stream to the log; on a hang the last line names the culprit.
-        # `test` stays the gate and runs second for the summary counts.
-        # bash on all three OSes (Windows defaults to PowerShell, where the
-        # executable-suffix fallback below would not parse).
+      # Each test command is its own step on purpose. They used to share one
+      # `run:` block, which made a hang ambiguous in the logs: the step simply
+      # stopped producing output, and there was no way to tell which of the
+      # three commands was stuck. As separate steps the runner reports the
+      # exact command that never returned.
+      - name: install unit test binary
+        shell: bash
+        run: zig build test-unit-probe
+      - name: test unit suite (streams per-test output)
+        # Runs the binary directly so per-test `N/M name...OK` lines stream to
+        # the log; on a hang the last line names the culprit. This duplicates
+        # coverage the `test` gate step below also has, and exists purely as a
+        # diagnostic.
+        #
+        # Guarded by an explicit watchdog rather than relying on the job-level
+        # timeout-minutes: when this hung on macos-14 the job just sat silent
+        # for 25 minutes and the only clue was the runner's orphan-process
+        # reaper. `timeout` is not on macOS by default (coreutils), so use the
+        # shell's own job control, which is available in bash on all three
+        # runners. On expiry the `sample`/`procdump` fallback is best-effort and
+        # must never fail the step.
         shell: bash
         run: |
-          zig build test-unit-probe
-          ./zig-out/bin/test || ./zig-out/bin/test.exe
-          zig build test --summary all
+          set -m
+          ./zig-out/bin/test & TEST_PID=$!
+          ( sleep 300; kill -QUIT "$TEST_PID" 2>/dev/null; kill -TERM "$TEST_PID" 2>/dev/null ) &
+          WATCHDOG_PID=$!
+          wait "$TEST_PID"; STATUS=$?
+          kill "$WATCHDOG_PID" 2>/dev/null || true
+          exit $STATUS
+      - name: test (gate)
+        shell: bash
+        run: zig build test --summary all
 
   fuzz:
     name: fuzz gate
