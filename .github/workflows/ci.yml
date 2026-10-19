@@ -20,6 +20,10 @@ jobs:
   build-test:
     name: build and test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Runner-level timeout (portable across ubuntu/macos/windows shells, where
+    # the GNU `timeout` command does not exist): a hung test fails the job
+    # instead of burning the 6h runner budget.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -37,9 +41,7 @@ jobs:
       - name: build
         run: zig build -Doptimize=ReleaseSafe
       - name: test
-        # timeout: a hung test must fail the job, not burn the 6h runner
-        # budget (a stuck accept()/sleep loop once did exactly that).
-        run: timeout 20m zig build test --summary all
+        run: zig build test --summary all
 
   fuzz:
     name: fuzz gate
@@ -57,6 +59,9 @@ jobs:
   bench:
     name: bench (${{ matrix.backend }})
     runs-on: ubuntu-latest
+    # Same portable hang protection as build-test (bench is ubuntu-only, but
+    # job-level timeouts behave identically on every runner OS).
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -98,17 +103,15 @@ jobs:
         if: matrix.backend == 'postgres'
         env:
           BEANLINE_DATABASE_URL: postgres://beanline:beanline@localhost:5432/beanline
-        # timeout: 30s duration + 5s warmup plus migrate/claim overhead;
-        # 10m means a wedged bench fails instead of burning runner hours.
         run: |
-          timeout 10m ./zig-out/bin/beanline bench --workload noop --duration 30 --warmup 5 \
+          ./zig-out/bin/beanline bench --workload noop --duration 30 --warmup 5 \
             --workers 8 --queues 2 --report bench-report-postgres.json
       - name: bench (redis)
         if: matrix.backend == 'redis'
         env:
           BEANLINE_REDIS_URL: redis://localhost:6379
         run: |
-          timeout 10m ./zig-out/bin/beanline bench --workload noop --duration 30 --warmup 5 \
+          ./zig-out/bin/beanline bench --workload noop --duration 30 --warmup 5 \
             --workers 8 --queues 2 --report bench-report-redis.json
       - name: gate against the reference
         if: github.event_name == 'schedule'
