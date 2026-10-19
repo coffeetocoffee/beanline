@@ -48,6 +48,29 @@ OIDC SSO has its own block of variables; see
 |---|---|---|
 | `BEANLINE_OTEL_ENDPOINT` | - | OTLP endpoint (`http://otel:4318`). |
 | `BEANLINE_LOG_PAYLOAD` | `false` | Log job args. Off by default for PII discipline. |
+| `BEANLINE_METRICS_MAX_KINDS` | `500` | Cap on distinct `kind` label values. |
+| `BEANLINE_METRICS_MAX_QUEUES` | `200` | Cap on distinct `queue` label values. |
+
+## Metrics label policy
+
+Prometheus label values are interned under a hard cap. Once a cap is reached,
+further values collapse into a single `__other__` series and the drop is
+counted in `beanline_metrics_label_overflow_total{label="kind"}` (same for
+`queue`), so the limit is visible rather than silent. Raise the caps if you
+run genuinely that many kinds; otherwise the overflow series tells you the
+labels are too noisy to be useful.
+
+Labels are deliberately narrow:
+
+- Counters and gauges: `kind`, `queue`, `state`, `label`.
+- Histograms (`beanline_job_duration_seconds`, `beanline_job_e2e_seconds`):
+  `kind` and `outcome` only.
+- Never attempt numbers, tags, job ids, or worker ids. Those are per-event
+  detail and belong in traces and the job event log, not in scraped series.
+
+The two histograms are separate on purpose. Handler duration is the fast
+per-attempt signal; enqueue-to-terminal widens by the whole retry backoff chain
+(§10.2), so folding the two together would blur the p99 you actually alert on.
 
 ## Notes
 

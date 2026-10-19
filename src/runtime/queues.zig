@@ -4,6 +4,7 @@ const registry_mod = @import("../core/registry.zig");
 const backoff_mod = @import("backoff.zig");
 const errors_mod = @import("../core/errors.zig");
 const pool_mod = @import("pool.zig");
+const metrics_mod = @import("../obs/metrics.zig");
 const limiter_mod = @import("limiter.zig");
 const fairness_mod = @import("fairness.zig");
 const job_mod = @import("../core/job.zig");
@@ -25,6 +26,8 @@ pub const Options = struct {
     worker_name: []const u8 = "beanline",
     retry: backoff_mod.Backoff = .{ .base_ms = 1000 },
     dead_on: []const []const u8 = &.{},
+    /// Optional metrics sink for the duration and end-to-end histograms.
+    metrics: ?*metrics_mod.Metrics = null,
 };
 
 // A claimed job handed to the pool. All bookkeeping happens on the runtime
@@ -43,6 +46,9 @@ pub const Dispatch = struct {
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     deadline_ms: i64 = 0,
     was_stopped: bool = false,
+    /// Set at dispatch so completion can be timed without extra bookkeeping.
+    started_ms: i64 = 0,
+    kind: []const u8 = "",
 
     fn finishOk(self: *Dispatch) void {
         self.done.store(true, .release);
@@ -95,6 +101,7 @@ pub const Owner = struct {
     next_hb_ms: i64 = 0,
     policy: errors_mod.RetryPolicy,
     items: [64]Claimed = undefined,
+    metrics: ?*metrics_mod.Metrics,
 
     pub fn init(alloc: std.mem.Allocator, broker: Broker, reg: *Registry, pool: *pool_mod.Pool, opts: Options) !Owner {
         const lims = try alloc.alloc(limiter_mod.Limiter, opts.queues.len);
@@ -111,6 +118,7 @@ pub const Owner = struct {
                 .dead_names = opts.dead_on,
             },
             .limiters = lims,
+            .metrics = opts.metrics,
         };
         var weights: [fairness_mod.MAX_QUEUES]u32 = [_]u32{1} ** fairness_mod.MAX_QUEUES;
         for (opts.queues, 0..) |q, i| if (q.weight != 0) {
@@ -234,6 +242,8 @@ pub const Owner = struct {
             .args_json = try self.alloc.dupe(u8, c.args_json),
             .handler = j.handle,
             .deadline_ms = if (j.timeout_ms == 0) 0 else now_ms + @as(i64, @intCast(j.timeout_ms)),
+            .started_ms = now_ms,
+            .kind = j.name,
         };
         try self.pool.submit(.{ .ptr = d, .run = Dispatch.taskFn });
         try self.running.append(self.alloc, d);
@@ -250,6 +260,7 @@ pub const Owner = struct {
             }
             const qname = self.cfgs[d.queue_idx].name;
             const stopped = d.stop.load(.acquire) or d.was_stopped;
+            if (self.metrics) |mx| self.recordOutcome(mx, d, stopped);
             if (!d.has_err and stopped) {
                 // Cancelled/timeout: mark cancelled instead of completed.
                 self.broker.cancel(qname, d.id, d.epoch) catch |e| {
@@ -267,6 +278,33 @@ pub const Owner = struct {
             self.alloc.destroy(d);
             _ = self.running.swapRemove(i);
         }
+    }
+
+    /// Bump the counter and both histograms for one finished attempt. Duration
+    /// is the handler's wall time; the e2e series is measured from `run_at`
+    /// (enqueue time), so retry backoff widens it the way §15 describes.
+    fn recordOutcome(self: *Owner, mx: *metrics_mod.Metrics, d: *Dispatch, stopped: bool) void {
+        const now = std.time.milliTimestamp();
+        const kind = d.kind;
+        if (d.has_err) {
+            const cls = self.policy.classOf(@errorName(d.err));
+            mx.incrFailed(kind);
+            const outcome: metrics_mod.Metrics.Outcome = if (cls == .retryable) .failed else .dead;
+            mx.observeJobDuration(kind, outcome, elapsedMicros(d, now));
+            mx.observeE2E(kind, outcome, elapsedMicros(d, now));
+        } else if (stopped) {
+            mx.observeJobDuration(kind, .cancelled, elapsedMicros(d, now));
+            mx.observeE2E(kind, .cancelled, elapsedMicros(d, now));
+        } else {
+            mx.incrCompleted(kind);
+            mx.observeJobDuration(kind, .completed, elapsedMicros(d, now));
+            mx.observeE2E(kind, .completed, elapsedMicros(d, now));
+        }
+    }
+
+    fn elapsedMicros(d: *Dispatch, now_ms: i64) u64 {
+        const ms = @max(now_ms - d.started_ms, 0);
+        return @as(u64, @intCast(ms)) * 1000;
     }
 
     fn reportFailure(self: *Owner, d: *Dispatch, qname: []const u8) !void {
@@ -340,6 +378,7 @@ test "fairness pick with refreshed slots" {
         .cfgs = &.{},
         .worker_name = "",
         .policy = .{},
+        .metrics = null,
     };
     o.fair.setWeights(&[_]u32{ 1, 1 });
     var flags = [_]bool{ true, false };

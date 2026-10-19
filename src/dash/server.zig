@@ -138,6 +138,11 @@ pub const Server = struct {
 
     fn handleConn(self: *Server, conn: std.net.Server.Connection) !void {
         defer conn.stream.close();
+        // A keep-alive client that has finished its request stays connected
+        // waiting for another head; without a stop check the accept thread
+        // would block in receiveHead() forever and stopServer()'s join would
+        // hang. The stop flag is the shutdown signal for this thread too.
+        if (self.stop.load(.seq_cst)) return;
         var read_buf: [32 * 1024]u8 = undefined;
         var srv = std.http.Server.init(conn, &read_buf);
         while (srv.state == .ready) {
@@ -146,7 +151,7 @@ pub const Server = struct {
                 self.respondStatus(&req, .internal_server_error, @errorName(e)) catch {};
                 return;
             };
-            if (srv.state != .ready) return;
+            if (srv.state != .ready or self.stop.load(.seq_cst)) return;
         }
     }
 

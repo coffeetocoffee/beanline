@@ -67,7 +67,10 @@ pub const App = struct {
             .alloc = alloc,
             .reg = registry.Registry.init(alloc),
             .cfg = cfg,
-            .metrics = metrics_mod.Metrics.init(alloc),
+            .metrics = metrics_mod.Metrics.initWithLimits(alloc, .{
+                .max_kinds = cfg.metrics_max_kinds,
+                .max_queues = cfg.metrics_max_queues,
+            }),
             .log = logs_mod.Logger.init(std.io.getStdErr()),
             .tracer = otel_mod.Tracer.init(alloc, cfg.otel_endpoint),
             .auth = dash_auth.Auth.init(alloc, cfg.dashboard_auth_secret, cfg.dashboard_readonly),
@@ -176,7 +179,7 @@ pub const App = struct {
         try pool.start(total_slots);
         defer pool.shutdown();
 
-        var owner = try queue_mod.Owner.init(self.alloc, br, &self.reg, &pool, .{ .queues = cfgs.items, .worker_name = "beanline" });
+        var owner = try queue_mod.Owner.init(self.alloc, br, &self.reg, &pool, .{ .queues = cfgs.items, .worker_name = "beanline", .metrics = &self.metrics });
         defer owner.deinit();
 
         // Optional dashboard tier in-process.

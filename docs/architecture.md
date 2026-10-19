@@ -506,8 +506,9 @@ not a runtime surprise.
 
 5-field (`m h dom mon dow`), 6-field (leading seconds), and descriptors
 (`@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`, `@reboot` ignored in
-daemon mode). Ranges, steps, lists, `L`/`W`/`#` day-extensions are in scope for
-1.0 (`L` and `W` deferred to 1.1, listed in Appendix A matrix).
+daemon mode). Ranges, steps, lists, and the `L`/`LW`/`nW` day-extensions
+are in scope for 1.0 (`#` and `nL` deferred to 1.1, listed in Appendix A
+matrix).
 
 ### 8.2 Timezone and DST correctness
 
@@ -868,6 +869,28 @@ default with a loud warning if bound to 0.0.0.0 without auth configured.
 - Health: `/healthz` (process alive), `/readyz` (broker connected, scheduler
   leader-or-follower, drain state); dashboard and alerts use the same signals.
 
+### 15.1 Label cardinality policy (decided for 1.0)
+
+Label values are interned under hard caps (`BEANLINE_METRICS_MAX_KINDS`,
+default 500; `BEANLINE_METRICS_MAX_QUEUES`, default 200). Past a cap, values
+collapse into one `__other__` series and the drop is counted in
+`beanline_metrics_label_overflow_total{label}` rather than being silently
+discarded, so the limit is observable and tunable.
+
+Labels are deliberately narrow, because `kind` and `queue` are user-controlled
+and histograms multiply by bucket count:
+
+- Counters and gauges: `kind`, `queue`, `state`, `label`.
+- Histograms `beanline_job_duration_seconds{kind,outcome}` and
+  `beanline_job_e2e_seconds{kind,outcome}`: `kind` and `outcome` only.
+- Never attempt numbers, tags, job ids, or worker ids on a histogram. That
+  per-event detail is what traces (§15) and the job event log are for.
+
+The two duration histograms are separate rather than one: handler duration is
+the fast per-attempt signal, while enqueue-to-terminal widens by the whole
+retry backoff chain (§10.2). One merged histogram would blur the p99 that
+§19 gates on.
+
 ---
 
 ## 16. Configuration and CLI
@@ -1097,7 +1120,7 @@ papering over it.
 | M4 | Runtime polish: fairness/weights, rate limiting, cancellation, graceful shutdown, sandbox mode | chaos partition/kill suites green incl. fencing asserts |
 | M5 | Dashboard + REST + SSE + auth (local + OIDC) + Prometheus/OTel | UI audit pass, security review, runbooks |
 | M6 (GA 1.0) | Docs, `beanline bench`, packaging (docker, binaries), fuzz gate, load soak (168 h) | benchmark vs references published; soak error budget met |
-| Post 1.0 | Plugin ABI for standalone-worker mode, DAG workflows v2, archive sinks, Kafka-style watermark metrics, `L`/`W` cron fields | per RFCs |
+| Post 1.0 | Plugin ABI for standalone-worker mode, DAG workflows v2, archive sinks, Kafka-style watermark metrics, `#`/`nL` cron fields | per RFCs |
 
 ---
 
@@ -1114,9 +1137,9 @@ papering over it.
 | Feature-parity temptation (delayed queues, AMQP, ...) | Non-goals (2) restated in PR template; roadmap owns the "no." |
 | Name confusion with beanstalkd (the old single-queue daemon) | Docs/FAQ lead with the differences (dual backend, leases, cron, dashboard); reserve `beanline` binary/package names early. |
 
-Open questions for review: (a) plugin ABI scope for standalone-worker mode,
-(b) should uniqueness support TTL-scoped keys natively (leaning yes, post-1.0),
-(c) metrics default for per-attempt histograms cardinality caps.
+Resolved for 1.0: (c) metrics cardinality caps are decided and shipped, see
+§15.1. Still open for review: (a) plugin ABI scope for standalone-worker mode,
+(b) should uniqueness support TTL-scoped keys natively (leaning yes, post-1.0).
 
 ---
 
@@ -1142,8 +1165,8 @@ Open questions for review: (a) plugin ABI scope for standalone-worker mode,
 | 5-field, 6-field, descriptors | yes | |
 | lists, ranges, steps | yes | |
 | IANA zones, DST rules | yes | skip-nonexistent / fire-once-ambiguous |
-| L (last day), W (nearest weekday) | 1.1 | documented in parser TODOs |
-| `#` (nth weekday) | yes | |
+| L (last day), LW (last weekday), nW (nearest weekday) | yes | day-of-month modifiers |
+| `#` (nth weekday) and nL (last nth weekday) | 1.1 | share the weekday-resolution machinery |
 | jitter, misfire policies | yes | 8.5 |
 
 ## Appendix B: Redis claim script (skeleton)

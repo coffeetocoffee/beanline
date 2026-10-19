@@ -19,6 +19,11 @@ pub const Schedule = struct {
     dom: Field,
     month: Field,
     dow: Field,
+    /// Day-of-month modifiers (Appendix A, 1.0). These cannot be expressed as
+    /// a fixed bitmask because their target day varies with month and year.
+    dom_last: bool = false, // "L"  -> last day of the month
+    dom_last_weekday: bool = false, // "LW" -> last weekday (Mon-Fri) of the month
+    dom_nearest: u32 = 0, // "nW" -> nearest weekday to day n
 
     pub fn parse(expr: []const u8) error{InvalidCron}!Schedule {
         const expanded = try expandDescriptor(expr);
@@ -33,7 +38,7 @@ pub const Schedule = struct {
 
         const minute = try parseField(tokens[0], 0, 59);
         const hour = try parseField(tokens[1], 0, 23);
-        const dom = try parseField(tokens[2], 1, 31);
+        const dom_parsed = try parseDom(tokens[2]);
         const month = try parseField(tokens[3], 1, 12);
         var dow = try parseField(tokens[4], 0, 7);
         const sunday_alias = dow.mask & (@as(u64, 1) << 7) != 0;
@@ -45,10 +50,72 @@ pub const Schedule = struct {
         return .{
             .minute = minute,
             .hour = hour,
-            .dom = dom,
+            .dom = dom_parsed.field,
             .month = month,
             .dow = dow,
+            .dom_last = dom_parsed.last,
+            .dom_last_weekday = dom_parsed.last_weekday,
+            .dom_nearest = dom_parsed.nearest,
         };
+    }
+
+    fn domHasModifier(self: Schedule) bool {
+        return self.dom_last or self.dom_last_weekday or self.dom_nearest != 0;
+    }
+
+    /// Days in month for a civil (year, month). Calendar-aware for Feb.
+    fn daysInMonth(year: u32, month: u32) u32 {
+        const leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
+        return switch (month) {
+            1, 3, 5, 7, 8, 10, 12 => 31,
+            4, 6, 9, 11 => 30,
+            else => if (leap) @as(u32, 29) else @as(u32, 28),
+        };
+    }
+
+    /// Weekday for a day index. 0=Sunday .. 6=Saturday (matches dow Field).
+    fn weekdayOf(day_idx: i64) u32 {
+        return @intCast(floorMod(day_idx + 4, 7));
+    }
+
+    /// True when the day-of-month field accepts `civil.day`, including the
+    /// L / LW / nW modifiers which resolve against the actual month length.
+    fn domDayMatches(self: Schedule, day_idx: i64, civil: Civil) bool {
+        if (self.dom.has(civil.day)) return true;
+        if (!self.dom.star and self.domHasModifier()) {
+            const dim = daysInMonth(civil.year, civil.month);
+            // day index of the nth day of this month
+            const idxOf = struct {
+                fn call(idx: i64, cur_day: u32, want: u32) i64 {
+                    const delta: i64 = @as(i64, @intCast(want)) - @as(i64, @intCast(cur_day));
+                    return idx + delta;
+                }
+            }.call;
+            if (self.dom_last) {
+                if (civil.day == dim) return true;
+            } else if (self.dom_last_weekday) {
+                // Last Mon-Fri of the month: walk back from the last day.
+                var d: u32 = dim;
+                while (d >= 1) : (d -= 1) {
+                    const wd = weekdayOf(idxOf(day_idx, civil.day, d));
+                    if (wd != 0 and wd != 6) return civil.day == d;
+                }
+                return false;
+            } else if (self.dom_nearest != 0) {
+                const n = self.dom_nearest;
+                // Clamp into the month, then nudge Sat->Fri and Sun->Mon.
+                var d = @min(n, dim);
+                var wd = weekdayOf(idxOf(day_idx, civil.day, d));
+                if (wd == 6 and d > 1) {
+                    d -= 1; // Sat -> Fri
+                    wd = weekdayOf(idxOf(day_idx, civil.day, d));
+                } else if (wd == 0 and d < dim) {
+                    d += 1; // Sun -> Mon
+                }
+                return civil.day == d;
+            }
+        }
+        return false;
     }
 
     pub fn matchesAt(self: Schedule, ts: i64) bool {
@@ -89,13 +156,7 @@ pub const Schedule = struct {
     }
 
     pub fn next(self: Schedule, after: i64) ?i64 {
-        // Fast reject for day-of-month values that can never occur (e.g.
-        // Feb 30/31): without this, a day that exists in no selected month
-        // spins the day-step all the way to the 2100 limit — ~10M iterations
-        // per call, and nextIn() repeats the scan up to 100k times. When
-        // both dom and dow are restricted, either one matching is enough
-        // (crontab OR semantics), so only reject when neither can fire.
-        if (!self.dom.star and !self.dow.star) {
+        if (!self.dom.star and !self.domHasModifier()) {
             var dom_possible = false;
             var d: u32 = 1;
             while (d <= 31) : (d += 1) {
@@ -105,6 +166,7 @@ pub const Schedule = struct {
                 }
             }
             if (!dom_possible) {
+                if (self.dow.star) return null;
                 var dow_possible = false;
                 var w: u32 = 0;
                 while (w <= 6) : (w += 1) {
@@ -115,16 +177,6 @@ pub const Schedule = struct {
                 }
                 if (!dow_possible) return null;
             }
-        } else if (!self.dom.star) {
-            var dom_possible = false;
-            var d: u32 = 1;
-            while (d <= 31) : (d += 1) {
-                if (self.dom.has(d) and monthCanHold(self.month, d)) {
-                    dom_possible = true;
-                    break;
-                }
-            }
-            if (!dom_possible) return null;
         }
         var t = after - floorMod(after, 60) + 60;
         const limit = daysFromCivil(2100, 1, 1) * 86400;
@@ -191,12 +243,12 @@ pub const Schedule = struct {
     }
 
     fn dayMatches(self: Schedule, day_idx: i64, civil: Civil) bool {
-        const wd: u32 = @intCast(floorMod(day_idx + 4, 7));
+        const wd: u32 = weekdayOf(day_idx);
         if (self.dom.star and self.dow.star) return true;
         if (!self.dom.star and !self.dow.star) {
-            return self.dom.has(civil.day) or self.dow.has(wd);
+            return self.domDayMatches(day_idx, civil) or self.dow.has(wd);
         }
-        if (!self.dom.star) return self.dom.has(civil.day);
+        if (!self.dom.star) return self.domDayMatches(day_idx, civil);
         return self.dow.has(wd);
     }
 
@@ -236,6 +288,58 @@ fn expandDescriptor(expr: []const u8) error{InvalidCron}![]const u8 {
         return error.InvalidCron;
     }
     return trimmed;
+}
+
+const DomResult = struct {
+    field: Field,
+    last: bool = false,
+    last_weekday: bool = false,
+    nearest: u32 = 0,
+};
+
+/// Parse the day-of-month field, which may carry the L / LW / nW modifiers
+/// (Appendix A, 1.0). Modifiers are single tokens; lists, ranges and steps
+/// use the ordinary field grammar pointing at concrete day numbers.
+fn parseDom(expr: []const u8) error{InvalidCron}!DomResult {
+    const trimmed = std.mem.trim(u8, expr, " \t");
+    var result = DomResult{ .field = undefined };
+    var parts = std.mem.splitScalar(u8, trimmed, ',');
+    var saw_plain = false;
+    while (parts.next()) |part| {
+        if (part.len == 0) return error.InvalidCron;
+        if (std.mem.eql(u8, part, "L")) {
+            if (result.last or result.last_weekday or result.nearest != 0) return error.InvalidCron;
+            result.last = true;
+        } else if (std.mem.eql(u8, part, "LW")) {
+            if (result.last or result.last_weekday or result.nearest != 0) return error.InvalidCron;
+            result.last_weekday = true;
+        } else if (part.len >= 2 and part[part.len - 1] == 'W') {
+            if (result.last or result.last_weekday or result.nearest != 0) return error.InvalidCron;
+            const day = std.fmt.parseInt(u32, part[0 .. part.len - 1], 10) catch return error.InvalidCron;
+            if (day < 1 or day > 31) return error.InvalidCron;
+            result.nearest = day;
+        } else {
+            saw_plain = true;
+        }
+    }
+    if (!result.last and !result.last_weekday and result.nearest == 0) {
+        result.field = try parseField(expr, 1, 31);
+    } else if (saw_plain) {
+        // Mixing a modifier with concrete day numbers: parse the concrete
+        // parts into a mask, then keep the modifier.
+        var mask: u64 = 0;
+        var parts2 = std.mem.splitScalar(u8, trimmed, ',');
+        while (parts2.next()) |part| {
+            if (std.mem.eql(u8, part, "L") or std.mem.eql(u8, part, "LW") or
+                (part.len >= 2 and part[part.len - 1] == 'W')) continue;
+            const f = try parseField(part, 1, 31);
+            mask |= f.mask;
+        }
+        result.field = .{ .mask = mask, .star = false };
+    } else {
+        result.field = .{ .mask = 0, .star = false };
+    }
+    return result;
 }
 
 fn parseField(expr: []const u8, lo: u32, hi: u32) error{InvalidCron}!Field {
@@ -448,6 +552,70 @@ test "impossible dates return null fast" {
     }
     const dt = std.time.milliTimestamp() - t0;
     try std.testing.expect(dt < 5000);
+}
+
+test "dom L is the last day of the month" {
+    // Jan 2026 has 31 days; the 31st is a Saturday.
+    const jan_last = daysFromCivil(2026, 1, 31) * 86400;
+    try expectNext("0 0 L * *", jan1_2026, jan_last);
+    // Feb 2026 has 28 days (not a leap year).
+    const feb_last = daysFromCivil(2026, 2, 28) * 86400;
+    try expectNext("0 0 L 2 *", jan1_2026, feb_last);
+    // Feb 2028 is a leap year: the last day is the 29th.
+    const feb28_leap = daysFromCivil(2028, 2, 29) * 86400;
+    try expectNext("0 0 L 2 *", daysFromCivil(2027, 12, 1) * 86400, feb28_leap);
+    // matchesAt agrees with the resolver.
+    const s = try Schedule.parse("0 0 L * *");
+    try std.testing.expect(s.matchesAt(jan_last));
+    try std.testing.expect(!s.matchesAt(jan_last - 86400));
+}
+
+test "dom LW is the last weekday of the month" {
+    // Jan 2026: the 31st is a Saturday, so the last weekday is Friday the 30th.
+    const s = try Schedule.parse("0 0 LW * *");
+    const jan_last_wd = daysFromCivil(2026, 1, 30) * 86400;
+    try std.testing.expectEqual(jan_last_wd, s.next(jan1_2026).?);
+    try std.testing.expect(s.matchesAt(jan_last_wd));
+    try std.testing.expect(!s.matchesAt(jan_last_wd - 86400));
+}
+
+test "dom nW is the nearest weekday to day n" {
+    // 15 Jan 2026 is a Thursday, so 15W is the 15th.
+    {
+        const s = try Schedule.parse("0 0 15W * *");
+        try std.testing.expectEqual(daysFromCivil(2026, 1, 15) * 86400, s.next(jan1_2026).?);
+    }
+    // 1 Jan 2026 is a Thursday, so 1W is the 1st.
+    {
+        const s = try Schedule.parse("0 0 1W * *");
+        try std.testing.expectEqual(jan1_2026, s.next(jan1_2026 - 60).?);
+    }
+    // 11 Jan 2026 is a Sunday, so 11W moves forward to Monday the 12th.
+    {
+        const s = try Schedule.parse("0 0 11W * *");
+        try std.testing.expectEqual(daysFromCivil(2026, 1, 12) * 86400, s.next(jan1_2026).?);
+    }
+    // 3 Jan 2026 is a Saturday, so 3W moves back to Friday the 2nd.
+    {
+        const s = try Schedule.parse("0 0 3W * *");
+        try std.testing.expectEqual(daysFromCivil(2026, 1, 2) * 86400, s.next(jan1_2026).?);
+    }
+}
+
+test "invalid dom modifier expressions rejected" {
+    const bad = [_][]const u8{
+        "0 0 W * *", // W without a day
+        "0 0 32W * *", // day out of range
+        "0 0 LL * *", // double modifier
+        "0 0 L,L * *", // repeated
+        "0 0 15WL * *",
+    };
+    for (bad) |expr| {
+        if (Schedule.parse(expr)) |_| {
+            std.debug.print("expected rejection for: {s}\n", .{expr});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
 }
 
 test "civil round trip" {

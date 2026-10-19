@@ -31,6 +31,10 @@ pub const Config = struct {
     oidc: auth_mod.Oidc = .{},
     otel_endpoint: []const u8 = "",
     log_payload: bool = false,
+    /// Cardinality caps for metrics label values (doc §24c). Label values
+    /// beyond the cap collapse into one `__other__` series.
+    metrics_max_kinds: usize = 500,
+    metrics_max_queues: usize = 200,
 
     /// Queue names plus the default concurrency, split from the "name:conc"
     /// config entries. Returns caller-owned slices.
@@ -162,6 +166,8 @@ pub fn load() Config {
     };
 
     c.log_payload = envBool("BEANLINE_LOG_PAYLOAD", false);
+    c.metrics_max_kinds = envNum(usize, "BEANLINE_METRICS_MAX_KINDS", 500) catch 500;
+    c.metrics_max_queues = envNum(usize, "BEANLINE_METRICS_MAX_QUEUES", 200) catch 200;
     return c;
 }
 
