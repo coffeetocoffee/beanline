@@ -63,7 +63,69 @@ pub const Schedule = struct {
         return true;
     }
 
+    /// True when the month set contains at least one month in which `day`
+    /// can occur (day <= 28 always can; 29 needs Feb or a 30/31-day month;
+    /// 30/31 need a matching long month).
+    fn monthCanHold(month: Field, day: u32) bool {
+        if (day <= 28) return true;
+        if (day == 29) {
+            // Feb (leap years) or any 30/31-day month works.
+            return month.has(2) or month.has(1) or month.has(3) or month.has(4) or
+                month.has(5) or month.has(6) or month.has(7) or month.has(8) or
+                month.has(9) or month.has(10) or month.has(11) or month.has(12);
+        }
+        if (day == 30) {
+            var m: u32 = 1;
+            while (m <= 12) : (m += 1) {
+                if (m != 2 and month.has(m)) return true;
+            }
+            return false;
+        }
+        // day 31: needs a 31-day month.
+        for ([_]u32{ 1, 3, 5, 7, 8, 10, 12 }) |m| {
+            if (month.has(m)) return true;
+        }
+        return false;
+    }
+
     pub fn next(self: Schedule, after: i64) ?i64 {
+        // Fast reject for day-of-month values that can never occur (e.g.
+        // Feb 30/31): without this, a day that exists in no selected month
+        // spins the day-step all the way to the 2100 limit — ~10M iterations
+        // per call, and nextIn() repeats the scan up to 100k times. When
+        // both dom and dow are restricted, either one matching is enough
+        // (crontab OR semantics), so only reject when neither can fire.
+        if (!self.dom.star and !self.dow.star) {
+            var dom_possible = false;
+            var d: u32 = 1;
+            while (d <= 31) : (d += 1) {
+                if (self.dom.has(d) and monthCanHold(self.month, d)) {
+                    dom_possible = true;
+                    break;
+                }
+            }
+            if (!dom_possible) {
+                var dow_possible = false;
+                var w: u32 = 0;
+                while (w <= 6) : (w += 1) {
+                    if (self.dow.has(w)) {
+                        dow_possible = true;
+                        break;
+                    }
+                }
+                if (!dow_possible) return null;
+            }
+        } else if (!self.dom.star) {
+            var dom_possible = false;
+            var d: u32 = 1;
+            while (d <= 31) : (d += 1) {
+                if (self.dom.has(d) and monthCanHold(self.month, d)) {
+                    dom_possible = true;
+                    break;
+                }
+            }
+            if (!dom_possible) return null;
+        }
         var t = after - floorMod(after, 60) + 60;
         const limit = daysFromCivil(2100, 1, 1) * 86400;
         var guard: u64 = 0;
@@ -352,6 +414,40 @@ test "invalid expressions rejected" {
 test "impossible date returns null" {
     const s = try Schedule.parse("0 0 30 2 *");
     try std.testing.expect(s.next(jan1_2026) == null);
+}
+
+test "impossible dates return null fast" {
+    // Feb 30/31 and 31st-of-a-30-day-month can never occur. They must be
+    // rejected up front: the day-step scan would otherwise walk to the 2100
+    // limit (~10M iterations), and nextIn() repeats the scan per candidate.
+    // The timer keeps the suite honest — this whole table must resolve in
+    // milliseconds, not minutes.
+    const t0 = std.time.milliTimestamp();
+    const cases = [_][]const u8{
+        "0 0 30 2 *",
+        "0 0 31 2 *",
+        "0 0 31 4 *",
+        "0 0 31 6 *",
+        "0 0 31 9 *",
+        "0 0 31 11 *",
+        "0 0 31 2,4,6,9,11 *",
+    };
+    for (cases) |expr| {
+        const s = try Schedule.parse(expr);
+        try std.testing.expect(s.next(0) == null);
+    }
+    // OR semantics still work: a valid dow saves an impossible dom.
+    {
+        const s = try Schedule.parse("0 0 31 2 3");
+        try std.testing.expect(s.next(0) != null);
+    }
+    // Feb 29 is possible (leap years) and still resolves via the scan.
+    {
+        const s = try Schedule.parse("0 0 29 2 *");
+        try std.testing.expect(s.next(0) != null);
+    }
+    const dt = std.time.milliTimestamp() - t0;
+    try std.testing.expect(dt < 5000);
 }
 
 test "civil round trip" {
