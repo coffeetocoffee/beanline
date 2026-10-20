@@ -1,7 +1,7 @@
 const std = @import("std");
 const cli = @import("cli/main.zig");
 
-pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
+pub const version = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 0 };
 
 pub const Job = @import("core/job.zig").Job;
 pub const Args = @import("core/job.zig").Args;
