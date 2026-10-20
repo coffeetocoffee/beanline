@@ -64,14 +64,14 @@ pub fn main() u8 {
         \\  migrate   apply pending SQL migrations (BEANLINE_DATABASE_URL)
         \\  worker    run the worker (drain queues)
         \\  server    run the dashboard/API tier only
-    \\  bench     run the workload generator (`beanline bench --help`)
-    \\  enqueue   enqueue a job (operator command)
-    \\  retry     retry dead jobs (operator command)
-    \\  schedule  manage cron schedules (operator command)
-    \\  stats     show queue stats (operator command)
-    \\  pause     pause a queue (operator command)
-    \\  resume    resume a queue (operator command)
-    \\  help      show this help
+        \\  bench     run the workload generator (`beanline bench --help`)
+        \\  enqueue   enqueue a job (operator command)
+        \\  retry     retry dead jobs (operator command)
+        \\  schedule  manage cron schedules (operator command)
+        \\  stats     show queue stats (operator command)
+        \\  pause     pause a queue (operator command)
+        \\  resume    resume a queue (operator command)
+        \\  help      show this help
         \\
     , .{}) catch return 1;
     return 0;
