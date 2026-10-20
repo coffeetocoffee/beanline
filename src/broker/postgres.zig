@@ -166,76 +166,19 @@ const Pg = struct {
     }
 
     fn quoteJson(self: *Pg, s: []const u8) ![]u8 {
-        var out = std.ArrayList(u8).init(self.alloc);
-        errdefer out.deinit();
-        try out.append('"');
-        for (s) |ch| {
-            switch (ch) {
-                '"' => try out.appendSlice("\\\""),
-                '\\' => try out.appendSlice("\\\\"),
-                else => {
-                    if (ch < 0x20) {
-                        var esc: [6]u8 = undefined;
-                        const e = try std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{ch});
-                        try out.appendSlice(e);
-                    } else {
-                        try out.append(ch);
-                    }
-                },
-            }
-        }
-        try out.append('"');
-        return try out.toOwnedSlice();
+        return try quoteJsonAlloc(self.alloc, s);
     }
 
     fn insertEvent(self: *Pg, job_id: i64, event_type: []const u8, data_json: []const u8) !void {
-        var idbuf: [24]u8 = undefined;
-        const idstr = try std.fmt.bufPrint(&idbuf, "{d}", .{job_id});
-        var rows = try self.c.query(SQL_EVENT, &.{ idstr, event_type, data_json });
-        rows.deinit();
+        try insertEventOnConn(self.alloc, &self.c, job_id, event_type, data_json);
     }
 
     fn enqueueImpl(self: *Pg, kind: []const u8, args_json: []const u8, opts: b.EnqueueOptions, out: *b.Enqueued) !void {
-        if (opts.unique == .replace) return error.UnsupportedUnique;
-        var pbuf: [3][24]u8 = undefined;
-        const pri = try std.fmt.bufPrint(&pbuf[0], "{d}", .{opts.priority});
-        const rat = try std.fmt.bufPrint(&pbuf[1], "{d}", .{opts.run_at_ms});
-        const ma = try std.fmt.bufPrint(&pbuf[2], "{d}", .{opts.max_attempts});
-        const params = [_]?[]const u8{ opts.queue, kind, args_json, pri, rat, ma, opts.unique_key, opts.dedup_run_id, opts.context_json };
-
         try self.c.execSimple("BEGIN");
         errdefer self.rollback();
-
-        const deduped_sql = opts.dedup_run_id != null;
-        const maybe_id: ?i64 = blk: {
-            var rows = try self.c.query(if (deduped_sql) SQL_INSERT_DEDUP else SQL_INSERT_UNIQUE, &params);
-            defer rows.deinit();
-            if (rows.rows.len == 0) break :blk null;
-            break :blk try intCell(i64, rows.rows[0], 0);
-        };
-
-        if (maybe_id) |id| {
-            const quoted_queue = try self.quoteJson(opts.queue);
-            defer self.alloc.free(quoted_queue);
-            var evbuf: [256]u8 = undefined;
-            const evdata = try std.fmt.bufPrint(&evbuf, "{{\"queue\":{s}}}", .{quoted_queue});
-            try self.insertEvent(id, "enqueued", evdata);
-            out.* = .{ .id = id, .deduped = false, .replaced = false };
-        } else {
-            const existing: i64 = if (deduped_sql) blk: {
-                var lr = try self.c.query(SQL_LOOKUP_DEDUP, &.{ kind, opts.dedup_run_id });
-                defer lr.deinit();
-                break :blk if (lr.rows.len > 0) try intCell(i64, lr.rows[0], 0) else 0;
-            } else blk: {
-                var lr = try self.c.query(SQL_LOOKUP_UNIQUE, &.{ opts.queue, kind, opts.unique_key });
-                defer lr.deinit();
-                break :blk if (lr.rows.len > 0) try intCell(i64, lr.rows[0], 0) else 0;
-            };
-            out.* = .{ .id = existing, .deduped = true, .replaced = false };
-        }
+        try enqueueCore(self.alloc, &self.c, kind, args_json, opts, out);
         try self.c.execSimple("COMMIT");
     }
-
     fn claimImpl(self: *Pg, queue: []const u8, limit: u32, worker_id: []const u8, lease_ms: u64, out: []b.Claimed) !usize {
         if (self.claim) |*r| {
             r.deinit();
@@ -264,8 +207,8 @@ const Pg = struct {
         errdefer rows.deinit();
 
         for (rows.rows) |row| {
-            const id = try intCell(i64, row, 0);
-            const epoch = try intCell(u64, row, 6);
+            const id = try Pg.intCell(i64, row, 0);
+            const epoch = try Pg.intCell(u64, row, 6);
             const quoted_worker = try self.quoteJson(worker_id);
             defer self.alloc.free(quoted_worker);
             var evbuf: [320]u8 = undefined;
@@ -277,15 +220,15 @@ const Pg = struct {
         while (i < rows.rows.len) : (i += 1) {
             const row = rows.rows[i];
             out[i] = .{
-                .id = try intCell(i64, row, 0),
+                .id = try Pg.intCell(i64, row, 0),
                 .queue = try textCell(row, 1),
                 .kind = try textCell(row, 2),
                 .args_json = try textCell(row, 3),
-                .attempts = try intCell(u32, row, 4),
-                .max_attempts = try intCell(u32, row, 5),
-                .lease_epoch = try intCell(u64, row, 6),
-                .priority = try intCell(u8, row, 7),
-                .run_at_ms = try intCell(i64, row, 8),
+                .attempts = try Pg.intCell(u32, row, 4),
+                .max_attempts = try Pg.intCell(u32, row, 5),
+                .lease_epoch = try Pg.intCell(u64, row, 6),
+                .priority = try Pg.intCell(u8, row, 7),
+                .run_at_ms = try Pg.intCell(i64, row, 8),
                 .context_json = try textCell(row, 9),
             };
         }
@@ -369,8 +312,8 @@ const Pg = struct {
         }
         const status_s = try textCell(rows.rows[0], 0);
         out.status = b.Status.fromSql(status_s) orelse return error.ProtocolViolation;
-        out.attempts = try intCell(u32, rows.rows[0], 1);
-        out.retry_at_ms = try intCell(i64, rows.rows[0], 2);
+        out.attempts = try Pg.intCell(u32, rows.rows[0], 1);
+        out.retry_at_ms = try Pg.intCell(i64, rows.rows[0], 2);
 
         const quoted_err = try self.quoteJson(err_name);
         defer self.alloc.free(quoted_err);
@@ -393,12 +336,12 @@ const Pg = struct {
         rows.deinit();
         if (count == 0) {
             var sr = try self.c.query(SQL_STATUS, &.{idstr});
+            defer sr.deinit();
             if (sr.rows.len == 0) {
                 self.rollback();
                 return error.NotFound;
             }
             const status = b.Status.fromSql(try textCell(sr.rows[0], 0)) orelse .running;
-            sr.deinit();
             if (status == .running) {
                 if (lease_epoch) |ep| {
                     var ebuf: [24]u8 = undefined;
@@ -444,9 +387,9 @@ const Pg = struct {
         const n: u32 = @intCast(rows.rows.len);
         if (n > 0) {
             for (rows.rows) |row| {
-                const id = try intCell(i64, row, 0);
+                const id = try Pg.intCell(i64, row, 0);
                 const status_s = try textCell(row, 1);
-                const attempts = try intCell(u32, row, 2);
+                const attempts = try Pg.intCell(u32, row, 2);
                 var evbuf: [160]u8 = undefined;
                 const evdata = try std.fmt.bufPrint(&evbuf, "{{\"status\":\"{s}\",\"attempts\":{d}}}", .{ status_s, attempts });
                 try self.insertEvent(id, "reaped", evdata);
@@ -462,13 +405,13 @@ const Pg = struct {
         if (rows.rows.len != 1) return error.ProtocolViolation;
         const row = rows.rows[0];
         out.* = .{
-            .available = try intCell(u64, row, 0),
-            .scheduled = try intCell(u64, row, 1),
-            .running = try intCell(u64, row, 2),
-            .dead = try intCell(u64, row, 3),
-            .completed = try intCell(u64, row, 4),
-            .cancelled = try intCell(u64, row, 5),
-            .oldest_available_ms = try intCell(i64, row, 6),
+            .available = try Pg.intCell(u64, row, 0),
+            .scheduled = try Pg.intCell(u64, row, 1),
+            .running = try Pg.intCell(u64, row, 2),
+            .dead = try Pg.intCell(u64, row, 3),
+            .completed = try Pg.intCell(u64, row, 4),
+            .cancelled = try Pg.intCell(u64, row, 5),
+            .oldest_available_ms = try Pg.intCell(i64, row, 6),
         };
     }
 };
@@ -787,6 +730,84 @@ fn discardCb(ctx: *anyopaque, queue: []const u8, id: i64) anyerror!void {
     self.mu.lock();
     defer self.mu.unlock();
     try discardImpl(self, queue, id);
+}
+
+
+fn insertEventOnConn(alloc: std.mem.Allocator, c: *pg.Conn, job_id: i64, event_type: []const u8, data_json: []const u8) !void {
+var idbuf: [24]u8 = undefined;
+const idstr = try std.fmt.bufPrint(&idbuf, "{d}", .{job_id});
+var rows = try c.query(SQL_EVENT, &.{ idstr, event_type, data_json });
+rows.deinit();
+_ = alloc;
+}
+
+fn enqueueCore(alloc: std.mem.Allocator, c: *pg.Conn, kind: []const u8, args_json: []const u8, opts: b.EnqueueOptions, out: *b.Enqueued) !void {
+if (opts.unique == .replace) return error.UnsupportedUnique;
+var pbuf: [3][24]u8 = undefined;
+const pri = try std.fmt.bufPrint(&pbuf[0], "{d}", .{opts.priority});
+const rat = try std.fmt.bufPrint(&pbuf[1], "{d}", .{opts.run_at_ms});
+const ma = try std.fmt.bufPrint(&pbuf[2], "{d}", .{opts.max_attempts});
+const params = [_]?[]const u8{ opts.queue, kind, args_json, pri, rat, ma, opts.unique_key, opts.dedup_run_id, opts.context_json };
+
+const deduped_sql = opts.dedup_run_id != null;
+const maybe_id: ?i64 = blk: {
+    var rows = try c.query(if (deduped_sql) SQL_INSERT_DEDUP else SQL_INSERT_UNIQUE, &params);
+    defer rows.deinit();
+    if (rows.rows.len == 0) break :blk null;
+    break :blk try Pg.intCell(i64, rows.rows[0], 0);
+};
+
+if (maybe_id) |id| {
+    const quoted_queue = try quoteJsonAlloc(alloc, opts.queue);
+    defer alloc.free(quoted_queue);
+    var evbuf: [256]u8 = undefined;
+    const evdata = try std.fmt.bufPrint(&evbuf, "{{\"queue\":{s}}}", .{quoted_queue});
+    try insertEventOnConn(alloc, c, id, "enqueued", evdata);
+    out.* = .{ .id = id, .deduped = false, .replaced = false };
+} else {
+    const existing: i64 = if (deduped_sql) blk: {
+        var lr = try c.query(SQL_LOOKUP_DEDUP, &.{ kind, opts.dedup_run_id });
+        defer lr.deinit();
+        break :blk if (lr.rows.len > 0) try Pg.intCell(i64, lr.rows[0], 0) else 0;
+    } else blk: {
+        var lr = try c.query(SQL_LOOKUP_UNIQUE, &.{ opts.queue, kind, opts.unique_key });
+        defer lr.deinit();
+        break :blk if (lr.rows.len > 0) try Pg.intCell(i64, lr.rows[0], 0) else 0;
+    };
+    out.* = .{ .id = existing, .deduped = true, .replaced = false };
+}
+}
+
+/// Enqueue a job on the caller's already-open transaction (`conn`). The
+/// caller owns BEGIN/COMMIT/ROLLBACK; this only runs the INSERT and the
+/// enqueued-event insert on that connection. This is the transactional
+/// outbox primitive (architecture.md 6.5).
+pub fn enqueueInTx(conn: *pg.Conn, alloc: std.mem.Allocator, kind: []const u8, args_json: []const u8, opts: b.EnqueueOptions, out: *b.Enqueued) !void {
+try enqueueCore(alloc, conn, kind, args_json, opts, out);
+}
+
+
+fn quoteJsonAlloc(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(alloc);
+    errdefer out.deinit();
+    try out.append('"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice("\\\""),
+            '\\' => try out.appendSlice("\\\\"),
+            else => {
+                if (ch < 0x20) {
+                    var esc: [6]u8 = undefined;
+                    const e = try std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{ch});
+                    try out.appendSlice(e);
+                } else {
+                    try out.append(ch);
+                }
+            },
+        }
+    }
+    try out.append('"');
+    return try out.toOwnedSlice();
 }
 
 pub const vtable = b.VTable{

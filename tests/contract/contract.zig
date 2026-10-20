@@ -546,7 +546,38 @@ fn case_retry_claimable_after_run_at(f: *Fixture) !void {
     try std.testing.expectEqual(@as(u32, 2), claimed[0].attempts);
 }
 
-// ---------------------------------------------------------------- capabilities
+fn case_transactional_enqueue(f: *Fixture) !void {
+    if (f.backend != .postgres) return;
+    const dsn = std.process.getEnvVarOwned(f.alloc, "BEANLINE_TEST_DSN") catch return error.NoBackendConfigured;
+    defer f.alloc.free(dsn);
+    const cfg = try beanline.parsePgDsn(f.alloc, dsn);
+    defer cfg.free(f.alloc);
+    var conn = try beanline.PgConn.connect(f.alloc, cfg);
+    defer conn.deinit();
+
+    // commit path
+    try conn.execSimple("BEGIN");
+    const e1 = blk: {
+        var out = broker.Enqueued{};
+        try beanline.enqueueIn(&conn, f.alloc, "ct.kind", "{\"n\":1}", .{ .queue = f.queue, .run_at_ms = 0 }, &out);
+        break :blk out;
+    };
+    try conn.execSimple("COMMIT");
+    const row1 = (try f.getJob(e1.id)).?;
+    try std.testing.expectEqual(broker.Status.available, row1.status);
+
+    // rollback path
+    try conn.execSimple("BEGIN");
+    const e2 = blk: {
+        var out = broker.Enqueued{};
+        try beanline.enqueueIn(&conn, f.alloc, "ct.kind", "{\"n\":2}", .{ .queue = f.queue, .run_at_ms = 0 }, &out);
+        break :blk out;
+    };
+    try conn.execSimple("ROLLBACK");
+    // the rolled-back job must not exist
+    const row2 = try f.getJob(e2.id);
+    try std.testing.expect(row2 == null);
+}
 
 fn case_capabilities_named_backend(f: *Fixture) !void {
     const caps = f.broker.capabilities();
@@ -723,6 +754,7 @@ pub const contract_cases = [_]harness.Case{
     .{ .name = "retry-claimable-after-run-at", .queue = "retry-yes", .run = case_retry_claimable_after_run_at },
     .{ .name = "capabilities-named-backend", .queue = "caps-name", .run = case_capabilities_named_backend },
     .{ .name = "capabilities-transactional-enqueue", .queue = "caps-tx", .run = case_capabilities_transactional_enqueue },
+    .{ .name = "transactional-enqueue-commit-rollback", .queue = "tx-enq", .run = case_transactional_enqueue },
 };
 
 pub const divergence_probes = [_]harness.Probe{

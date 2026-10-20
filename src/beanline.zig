@@ -21,6 +21,24 @@ pub const broker_api = @import("broker/broker.zig");
 /// backends.
 pub const PostgresBroker = @import("broker/postgres.zig");
 pub const RedisBroker = @import("broker/redis.zig");
+
+/// Postgres connection handle, for transactional enqueue (architecture.md 6.5).
+pub const PgConn = @import("broker/pg/conn.zig").Conn;
+
+/// Postgres connection config, for transactional enqueue.
+pub const PgConnConfig = @import("broker/pg/conn.zig").Config;
+
+/// Parse a Postgres DSN into a connection config.
+pub fn parsePgDsn(alloc: std.mem.Allocator, dsn: []const u8) !PgConnConfig {
+    return @import("broker/pg/conn.zig").parseDsn(alloc, dsn);
+}
+
+/// Transactional enqueue: insert a job on the caller's already-open
+/// transaction. The caller owns BEGIN/COMMIT/ROLLBACK. Postgres-only;
+/// Redis reports capabilities().transactional_enqueue == false.
+pub fn enqueueIn(conn: *PgConn, alloc: std.mem.Allocator, kind: []const u8, args_json: []const u8, opts: broker_api.EnqueueOptions, out: *broker_api.Enqueued) !void {
+    return PostgresBroker.enqueueInTx(conn, alloc, kind, args_json, opts, out);
+}
 pub const App = @import("runtime/supervisor.zig").App;
 pub const Broker = @import("broker/broker.zig").Broker;
 pub const RetryPolicy = @import("core/errors.zig").RetryPolicy;
