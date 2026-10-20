@@ -165,6 +165,58 @@ jobs:
       - name: fuzz gate
         run: zig build fuzz-gate --summary all
 
+  contract:
+    name: contract suite (postgres + redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: beanline
+          POSTGRES_PASSWORD: beanline
+          POSTGRES_DB: beanline
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U beanline"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: build
+        run: zig build -Doptimize=ReleaseSafe
+      - name: migrate (postgres)
+        env:
+          BEANLINE_DATABASE_URL: postgres://beanline:beanline@localhost:5432/beanline
+        run: ./zig-out/bin/beanline migrate
+      - name: install contract test binary
+        run: zig build test-contract-install
+      - name: test contract suite
+        env:
+          BEANLINE_TEST_DSN: postgres://beanline:beanline@localhost:5432/beanline
+          BEANLINE_TEST_REDIS_URL: redis://localhost:6379
+          BEANLINE_CONTRACT_REQUIRED: "1"
+        shell: bash
+        run: |
+          set -m
+          ./zig-out/bin/test-contract & TEST_PID=$!
+          ( sleep 300; kill -QUIT "$TEST_PID" 2>/dev/null; kill -TERM "$TEST_PID" 2>/dev/null ) &
+          WATCHDOG_PID=$!
+          wait "$TEST_PID"; STATUS=$?
+          kill "$WATCHDOG_PID" 2>/dev/null || true
+          exit $STATUS
   bench:
     name: bench (${{ matrix.backend }})
     runs-on: ubuntu-latest
