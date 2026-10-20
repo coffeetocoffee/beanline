@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Design draft v1.0 (for review) |
+| Status | Design draft v1.0 (reviewed) |
 | Author | Engineering |
 | Date | 2026-10-17 |
 | Language | Zig (0.14.x or newer, std-only where practical) |
@@ -1137,13 +1137,13 @@ papering over it.
 | Milestone | Scope | Exit criteria |
 |---|---|---|
 | M0 (spike, 2 wks) | PG broker + claim/heartbeat/ack, 1 queue, thread pool, noop kinds | contract suite core passes; chaos kill -9 clean |
-| M1 | Full PG backend: unique, batches (simple), retries/backoff, dead, events, CLI enqueue/retry, config, migrations | contract suite green; benchmark table v1 |
+| M1 | Full PG backend: unique, retries/backoff, dead, events, CLI enqueue/retry, config, migrations | contract suite green; benchmark table v1 |
 | M2 | Redis backend + capability flags + leader/promoter/reaper | dual-backend CI green incl. chaos |
 | M3 | Scheduler: cron, tz, DST, jitter, dedup, leader; `catchUp` policies | DST matrix tests pass; tzdata compile pipeline |
-| M4 | Runtime polish: fairness/weights, rate limiting, cancellation, graceful shutdown, sandbox mode | chaos partition/kill suites green incl. fencing asserts |
+| M4 | Runtime polish: fairness/weights, rate limiting, cancellation, graceful shutdown | chaos partition/kill suites green incl. fencing asserts |
 | M5 | Dashboard + REST + SSE + auth (local + OIDC) + Prometheus/OTel | UI audit pass, security review, runbooks |
 | M6 (GA 1.0) | Docs, `beanline bench`, packaging (docker, binaries), fuzz gate, load soak (168 h) | benchmark vs references published; soak error budget met |
-| Post 1.0 | Plugin ABI for standalone-worker mode, DAG workflows v2, archive sinks, Kafka-style watermark metrics, `#`/`nL` cron fields | per RFCs |
+| Post 1.0 | Plugin ABI, sandbox mode, batches/DAG workflows, backpressure/retention controls, archive sinks, Kafka-style watermark metrics, `#`/`nL` cron fields | per RFCs |
 
 ---
 
@@ -1161,8 +1161,9 @@ papering over it.
 | Name confusion with beanstalkd (the old single-queue daemon) | Docs/FAQ lead with the differences (dual backend, leases, cron, dashboard); reserve `beanline` binary/package names early. |
 
 Resolved for 1.0: (c) metrics cardinality caps are decided and shipped, see
-§15.1. Still open for review: (a) plugin ABI scope for standalone-worker mode,
-(b) should uniqueness support TTL-scoped keys natively (leaning yes, post-1.0).
+§15.1. Resolved: (a) no plugin ABI in 1.0 (standalone worker is statically
+linked; dynamic plugins deferred to 1.1), (b) uniqueness supports TTL-scoped keys
+natively, shipped post-1.0.
 
 ---
 

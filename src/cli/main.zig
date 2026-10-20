@@ -48,6 +48,15 @@ pub fn main() u8 {
         return bench.run(alloc, argv) catch 1;
     }
 
+    // Operator commands (stubs): full implementations pending.
+    if (std.mem.eql(u8, cmd, "enqueue") or std.mem.eql(u8, cmd, "retry") or
+        std.mem.eql(u8, cmd, "schedule") or std.mem.eql(u8, cmd, "stats") or
+        std.mem.eql(u8, cmd, "pause") or std.mem.eql(u8, cmd, "resume"))
+    {
+        stdout.print("beanline: `{s}` operator command not yet implemented\n", .{cmd}) catch return 1;
+        return 1;
+    }
+
     stdout.print(
         \\beanline - a job queue and background worker system
         \\usage: beanline <command>
@@ -55,8 +64,14 @@ pub fn main() u8 {
         \\  migrate   apply pending SQL migrations (BEANLINE_DATABASE_URL)
         \\  worker    run the worker (drain queues)
         \\  server    run the dashboard/API tier only
-        \\  bench     run the workload generator (`beanline bench --help`)
-        \\  help      show this help
+    \\  bench     run the workload generator (`beanline bench --help`)
+    \\  enqueue   enqueue a job (operator command)
+    \\  retry     retry dead jobs (operator command)
+    \\  schedule  manage cron schedules (operator command)
+    \\  stats     show queue stats (operator command)
+    \\  pause     pause a queue (operator command)
+    \\  resume    resume a queue (operator command)
+    \\  help      show this help
         \\
     , .{}) catch return 1;
     return 0;
