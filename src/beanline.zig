@@ -7,10 +7,20 @@ pub const Job = @import("core/job.zig").Job;
 pub const Args = @import("core/job.zig").Args;
 pub const JobContext = @import("core/job.zig").Context;
 /// Low-level building blocks, exported so the fuzz targets in tests/fuzz can
-/// reach them without importing files outside their module path.
+/// reach them without importing files outside their own module path.
 pub const Resp = @import("broker/resp/client.zig");
 pub const CronSchedule = @import("sched/cron.zig").Schedule;
 pub const PgProto = @import("broker/pg/proto.zig");
+/// Broker interface types (options, status, rows, depth, capabilities). Exported
+/// so tooling and tests that drive the broker directly (e.g. the contract
+/// suite in tests/contract) can name them without importing files outside
+/// their module path.
+pub const broker_api = @import("broker/broker.zig");
+/// Backend implementations, for tooling that opens a specific backend. The
+/// contract suite uses these to run the same assertions against both
+/// backends.
+pub const PostgresBroker = @import("broker/postgres.zig");
+pub const RedisBroker = @import("broker/redis.zig");
 pub const App = @import("runtime/supervisor.zig").App;
 pub const Broker = @import("broker/broker.zig").Broker;
 pub const RetryPolicy = @import("core/errors.zig").RetryPolicy;

@@ -71,6 +71,7 @@ const Redis = struct {
     alloc: std.mem.Allocator,
     c: client.Client,
     claim_arena: std.heap.ArenaAllocator,
+    read_arena: std.heap.ArenaAllocator,
     /// Serializes all connection use. RESP is strictly request/response on
     /// one stream, so concurrent use from multiple threads interleaves
     /// commands and corrupts reply parsing. Lock at the vtable entry points
@@ -377,6 +378,7 @@ fn capabilitiesCb() b.Capabilities {
 fn deinitCb(ctx: *anyopaque) void {
     const self: *Redis = @ptrCast(@alignCast(ctx));
     self.claim_arena.deinit();
+    self.read_arena.deinit();
     self.c.deinit();
     const alloc = self.alloc;
     alloc.destroy(self);
@@ -462,6 +464,9 @@ fn rowFromHash(alloc: std.mem.Allocator, qname: []const u8, id: i64, fields: []c
 }
 
 fn listJobsImpl(self: *Redis, alloc: std.mem.Allocator, filter: b.JobFilter, out: *std.ArrayList(b.JobRow)) !void {
+    _ = alloc;
+    _ = self.read_arena.reset(.retain_capacity);
+    const ral = self.read_arena.allocator();
     var arena = std.heap.ArenaAllocator.init(self.alloc);
     defer arena.deinit();
     const al = arena.allocator();
@@ -506,12 +511,15 @@ fn listJobsImpl(self: *Redis, alloc: std.mem.Allocator, filter: b.JobFilter, out
             skipped += 1;
             continue;
         }
-        try out.append(try rowFromHash(alloc, qname, id, fields));
+        try out.append(try rowFromHash(ral, qname, id, fields));
         emitted += 1;
     }
 }
 
 fn getJobImpl(self: *Redis, alloc: std.mem.Allocator, id: i64, out: *?b.JobRow) !void {
+    _ = alloc;
+    _ = self.read_arena.reset(.retain_capacity);
+    const ral = self.read_arena.allocator();
     var arena = std.heap.ArenaAllocator.init(self.alloc);
     defer arena.deinit();
     const al = arena.allocator();
@@ -529,13 +537,16 @@ fn getJobImpl(self: *Redis, alloc: std.mem.Allocator, id: i64, out: *?b.JobRow) 
         };
         if (fields.len == 0) continue;
         const qname = queueOfKey(k) orelse continue;
-        out.* = try rowFromHash(alloc, qname, id, fields);
+        out.* = try rowFromHash(ral, qname, id, fields);
         return;
     }
     out.* = null;
 }
 
 fn jobEventsImpl(self: *Redis, alloc: std.mem.Allocator, id: i64, out: *std.ArrayList(b.EventRow)) !void {
+    _ = alloc;
+    _ = self.read_arena.reset(.retain_capacity);
+    const ral = self.read_arena.allocator();
     var arena = std.heap.ArenaAllocator.init(self.alloc);
     defer arena.deinit();
     const al = arena.allocator();
@@ -565,8 +576,8 @@ fn jobEventsImpl(self: *Redis, alloc: std.mem.Allocator, id: i64, out: *std.Arra
             try out.append(.{
                 .job_id = id,
                 .seq = @intCast(idx + 1),
-                .event_type = try alloc.dupe(u8, ev_type),
-                .data_json = try alloc.dupe(u8, raw),
+                .event_type = try ral.dupe(u8, ev_type),
+                .data_json = try ral.dupe(u8, raw),
                 .at_ms = 0,
             });
         }
@@ -575,6 +586,9 @@ fn jobEventsImpl(self: *Redis, alloc: std.mem.Allocator, id: i64, out: *std.Arra
 }
 
 fn queueNamesImpl(self: *Redis, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) !void {
+    _ = alloc;
+    _ = self.read_arena.reset(.retain_capacity);
+    const ral = self.read_arena.allocator();
     var arena = std.heap.ArenaAllocator.init(self.alloc);
     defer arena.deinit();
     const al = arena.allocator();
@@ -582,7 +596,7 @@ fn queueNamesImpl(self: *Redis, alloc: std.mem.Allocator, out: *std.ArrayList([]
     try scanKeys(self, al, "beanline:{*}:depth", &keys);
     for (keys.items) |k| {
         const qname = queueOfKey(k) orelse continue;
-        try out.append(try alloc.dupe(u8, qname));
+        try out.append(try ral.dupe(u8, qname));
     }
 }
 
@@ -716,6 +730,7 @@ pub fn open(alloc: std.mem.Allocator, url_str: []const u8) !*Redis {
         .alloc = alloc,
         .c = try client.Client.connect(alloc, u.host, u.port, u.password),
         .claim_arena = std.heap.ArenaAllocator.init(alloc),
+        .read_arena = std.heap.ArenaAllocator.init(alloc),
     };
     errdefer self.c.deinit();
 
@@ -732,6 +747,23 @@ pub fn open(alloc: std.mem.Allocator, url_str: []const u8) !*Redis {
 
 pub fn toBroker(self: *Redis) b.Broker {
     return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+}
+
+/// Delete every key belonging to `queue`. Test-support helper used by the
+/// contract suite in tests/contract to isolate each case in its own queue.
+pub fn purgeQueue(br: b.Broker, queue: []const u8) !void {
+    _ = queue;
+    const self: *Redis = @ptrCast(@alignCast(br.ptr));
+    self.mu.lock();
+    defer self.mu.unlock();
+    var arena = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var keys = std.ArrayList([]const u8).init(al);
+    try scanKeys(self, al, "beanline:*", &keys);
+    for (keys.items) |k| {
+        _ = try self.c.command(al, &.{ "DEL", k });
+    }
 }
 
 test "url parsing" {

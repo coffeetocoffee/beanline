@@ -144,6 +144,7 @@ const Pg = struct {
     alloc: std.mem.Allocator,
     c: pg.Conn,
     claim: ?pg.Rows = null,
+    read_arena: std.heap.ArenaAllocator,
     /// Serializes all connection use. The Postgres wire protocol is strictly
     /// request/response on one stream, and several operations pair BEGIN with
     /// COMMIT, so concurrent use from multiple threads corrupts the frame
@@ -221,13 +222,15 @@ const Pg = struct {
             try self.insertEvent(id, "enqueued", evdata);
             out.* = .{ .id = id, .deduped = false, .replaced = false };
         } else {
-            const lookup_params = if (deduped_sql)
-                [_]?[]const u8{ opts.queue, kind, opts.dedup_run_id }
-            else
-                [_]?[]const u8{ opts.queue, kind, opts.unique_key };
-            var lr = try self.c.query(if (deduped_sql) SQL_LOOKUP_DEDUP else SQL_LOOKUP_UNIQUE, &lookup_params);
-            defer lr.deinit();
-            const existing: i64 = if (lr.rows.len > 0) try intCell(i64, lr.rows[0], 0) else 0;
+            const existing: i64 = if (deduped_sql) blk: {
+                var lr = try self.c.query(SQL_LOOKUP_DEDUP, &.{ kind, opts.dedup_run_id });
+                defer lr.deinit();
+                break :blk if (lr.rows.len > 0) try intCell(i64, lr.rows[0], 0) else 0;
+            } else blk: {
+                var lr = try self.c.query(SQL_LOOKUP_UNIQUE, &.{ opts.queue, kind, opts.unique_key });
+                defer lr.deinit();
+                break :blk if (lr.rows.len > 0) try intCell(i64, lr.rows[0], 0) else 0;
+            };
             out.* = .{ .id = existing, .deduped = true, .replaced = false };
         }
         try self.c.execSimple("COMMIT");
@@ -540,6 +543,7 @@ fn capabilitiesCb() b.Capabilities {
 fn deinitCb(ctx: *anyopaque) void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
     if (self.claim) |*r| r.deinit();
+    self.read_arena.deinit();
     self.c.deinit();
     const alloc = self.alloc;
     alloc.destroy(self);
@@ -599,6 +603,8 @@ fn rowToJobRow(row: []?[]const u8) !b.JobRow {
 }
 
 fn listJobsImpl(self: *Pg, alloc: std.mem.Allocator, filter: b.JobFilter, out: *std.ArrayList(b.JobRow)) !void {
+    _ = self.read_arena.reset(.retain_capacity);
+    const ral = self.read_arena.allocator();
     var sql = std.ArrayList(u8).init(alloc);
     defer sql.deinit();
     try sql.appendSlice(SQL_LIST_BASE);
@@ -639,12 +645,31 @@ fn listJobsImpl(self: *Pg, alloc: std.mem.Allocator, filter: b.JobFilter, out: *
     var rows = try self.c.query(sql.items, params.items);
     defer rows.deinit();
     for (rows.rows) |row| {
-        try out.append(try rowToJobRow(row));
+        const jr = try rowToJobRow(row);
+        const owned = b.JobRow{
+            .id = jr.id,
+            .queue = try ral.dupe(u8, jr.queue),
+            .kind = try ral.dupe(u8, jr.kind),
+            .args_json = try ral.dupe(u8, jr.args_json),
+            .status = jr.status,
+            .priority = jr.priority,
+            .run_at_ms = jr.run_at_ms,
+            .attempts = jr.attempts,
+            .max_attempts = jr.max_attempts,
+            .lease_epoch = jr.lease_epoch,
+            .worker_id = try ral.dupe(u8, jr.worker_id),
+            .inserted_ms = jr.inserted_ms,
+            .started_ms = jr.started_ms,
+            .finished_ms = jr.finished_ms,
+        };
+        try out.append(owned);
     }
 }
 
 fn getJobImpl(self: *Pg, alloc: std.mem.Allocator, id: i64, out: *?b.JobRow) !void {
     _ = alloc;
+    _ = self.read_arena.reset(.retain_capacity);
+    const ral = self.read_arena.allocator();
     var ibuf: [24]u8 = undefined;
     const ids = try std.fmt.bufPrint(&ibuf, "{d}", .{id});
     var rows = try self.c.query(SQL_GET_ONE, &.{ids});
@@ -653,11 +678,29 @@ fn getJobImpl(self: *Pg, alloc: std.mem.Allocator, id: i64, out: *?b.JobRow) !vo
         out.* = null;
         return;
     }
-    out.* = try rowToJobRow(rows.rows[0]);
+    const jr = try rowToJobRow(rows.rows[0]);
+    out.* = b.JobRow{
+        .id = jr.id,
+        .queue = try ral.dupe(u8, jr.queue),
+        .kind = try ral.dupe(u8, jr.kind),
+        .args_json = try ral.dupe(u8, jr.args_json),
+        .status = jr.status,
+        .priority = jr.priority,
+        .run_at_ms = jr.run_at_ms,
+        .attempts = jr.attempts,
+        .max_attempts = jr.max_attempts,
+        .lease_epoch = jr.lease_epoch,
+        .worker_id = try ral.dupe(u8, jr.worker_id),
+        .inserted_ms = jr.inserted_ms,
+        .started_ms = jr.started_ms,
+        .finished_ms = jr.finished_ms,
+    };
 }
 
 fn jobEventsImpl(self: *Pg, alloc: std.mem.Allocator, id: i64, out: *std.ArrayList(b.EventRow)) !void {
     _ = alloc;
+    _ = self.read_arena.reset(.retain_capacity);
+    const ral = self.read_arena.allocator();
     var ibuf: [24]u8 = undefined;
     const ids = try std.fmt.bufPrint(&ibuf, "{d}", .{id});
     var rows = try self.c.query(SQL_EVENTS, &.{ids});
@@ -666,8 +709,8 @@ fn jobEventsImpl(self: *Pg, alloc: std.mem.Allocator, id: i64, out: *std.ArrayLi
         try out.append(.{
             .job_id = try Pg.intCell(i64, row, 0),
             .seq = try Pg.intCell(i64, row, 1),
-            .event_type = try Pg.textCell(row, 2),
-            .data_json = try Pg.textCell(row, 3),
+            .event_type = try ral.dupe(u8, try Pg.textCell(row, 2)),
+            .data_json = try ral.dupe(u8, try Pg.textCell(row, 3)),
             .at_ms = try Pg.intCell(i64, row, 4),
         });
     }
@@ -675,10 +718,12 @@ fn jobEventsImpl(self: *Pg, alloc: std.mem.Allocator, id: i64, out: *std.ArrayLi
 
 fn queueNamesImpl(self: *Pg, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) !void {
     _ = alloc;
+    _ = self.read_arena.reset(.retain_capacity);
+    const ral = self.read_arena.allocator();
     var rows = try self.c.query(SQL_QUEUE_NAMES, &.{});
     defer rows.deinit();
     for (rows.rows) |row| {
-        try out.append(try Pg.textCell(row, 0));
+        try out.append(try ral.dupe(u8, try Pg.textCell(row, 0)));
     }
 }
 
@@ -769,12 +814,22 @@ pub fn open(alloc: std.mem.Allocator, dsn: []const u8) !*Pg {
     defer cfg.free(alloc);
     const self = try alloc.create(Pg);
     errdefer alloc.destroy(self);
-    self.* = .{ .alloc = alloc, .c = try pg.Conn.connect(alloc, cfg) };
+    self.* = .{ .alloc = alloc, .c = try pg.Conn.connect(alloc, cfg), .read_arena = std.heap.ArenaAllocator.init(alloc) };
     return self;
 }
 
 pub fn toBroker(self: *Pg) b.Broker {
     return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+}
+
+/// Delete every job and event belonging to `queue`. Test-support helper used by
+/// the contract suite in tests/contract to isolate each case in its own queue.
+pub fn purgeQueue(br: b.Broker, queue: []const u8) !void {
+    const self: *Pg = @ptrCast(@alignCast(br.ptr));
+    self.mu.lock();
+    defer self.mu.unlock();
+    var rows = try self.c.query("DELETE FROM beanline_jobs WHERE queue = $1", &.{queue});
+    rows.deinit();
 }
 
 test "id and epoch arrays build postgres literals" {
@@ -790,7 +845,7 @@ test "id and epoch arrays build postgres literals" {
 }
 
 test "json quoting escapes" {
-    var p = Pg{ .alloc = std.testing.allocator, .c = undefined };
+    var p = Pg{ .alloc = std.testing.allocator, .c = undefined, .read_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
     const q = try p.quoteJson("a\"b\\c");
     defer p.alloc.free(q);
     try std.testing.expectEqualStrings("\"a\\\"b\\\\c\"", q);

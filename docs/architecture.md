@@ -1062,8 +1062,31 @@ papering over it.
 1. Contract suite (the keystone): one file of ~120 tests written against the
    `Broker` interface; runs identically against PG and Redis. Covers claim
    atomicity, fencing writes, lease expiry/reap, cancel races, unique-key
-   semantics, promote boundaries, batch counters, and the full state machine of
-   5.3. A backend change that passes in PG and not Redis fails CI, full stop.
+   semantics, promote boundaries, batch counters, and the full state machine
+   of 5.3. A backend change that passes in PG and not Redis fails CI, full stop.
+
+   Implemented as `tests/contract/` (56 shared cases + 16 documented
+   divergence probes), executed by `zig build test-contract` and by the CI
+   `contract` job against live Postgres and Redis. The suite also surfaced
+   the following pre-existing divergences (see §24):
+   - PG's `dedup_run_id` conflict path had a parameter-count mismatch
+     (`lookup_params` passed 3 values to a 2-placeholder query) which made
+     cron idempotency error out instead of deduping; fixed in this change.
+   - PG keeps the unique key held after a job dies; Redis releases it.
+   - Redis's `claim` harvests due delayed (scheduled) jobs itself, so they
+     become claimable without an explicit `promote()`; PG requires promote.
+   - PG's `enqueue` stores args as JSONB and returns normalized JSON
+     (whitespace/key order); Redis returns the verbatim string.
+   - PG's `enqueue` stores `run_at = now()` for immediate jobs; Redis
+     stores `0`, so `Claimed.run_at_ms` is 0 on Redis.
+   - PG's `promote`/`reap` are global (ignore the queue argument); Redis's
+     are per-queue (documented in §7.5).
+   - PG records a real per-event timestamp; Redis stores 0.
+   - Redis's `depth` never populates `oldest_available_ms`.
+   - PG's `heartbeat` matches (id, epoch) independently rather than paired
+     (potential fencing looseness; not yet observable as a test failure).
+   - Batch counters / DAG workflows are not yet implemented (§12), so the
+     contract suite does not cover them.
 2. Deterministic scheduler tests: property-based cron next-fire generator over
    1970..2060 for all configured zones (including DST edge times), replayable
    seeds; misfire matrix tests (leader gap at day/week/month boundaries).

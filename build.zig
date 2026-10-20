@@ -120,4 +120,26 @@ pub fn build(b: *std.Build) void {
     const install_probe = b.addInstallArtifact(unit_probe, .{});
     const test_unit_probe_step = b.step("test-unit-probe", "Install the unit test binary for direct streaming runs");
     test_unit_probe_step.dependOn(&install_probe.step);
+
+    // Contract suite: one shared suite of assertions run against both backends.
+    // Each case is written against the Broker interface so a backend change
+    // that passes on one backend but not the other fails CI.
+    const contract_mod = b.createModule(.{
+        .root_source_file = b.path("tests/contract/all.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    contract_mod.addImport("beanline", beanline_mod);
+    const contract_tests = b.addTest(.{
+        .root_module = contract_mod,
+        .name = "test-contract",
+    });
+    const run_contract_tests = b.addRunArtifact(contract_tests);
+    const contract_test_step = b.step("test-contract", "Run the shared contract suite (requires a live backend)");
+    contract_test_step.dependOn(&run_contract_tests.step);
+    // Install-only counterpart so CI can run the binary directly (the Zig
+    // 0.14.1 build runner hangs when executing test binaries on macOS).
+    const install_contract_tests = b.addInstallArtifact(contract_tests, .{});
+    const contract_test_install_step = b.step("test-contract-install", "Install the contract test binary for direct runs");
+    contract_test_install_step.dependOn(&install_contract_tests.step);
 }
