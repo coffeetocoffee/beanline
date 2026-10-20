@@ -732,50 +732,49 @@ fn discardCb(ctx: *anyopaque, queue: []const u8, id: i64) anyerror!void {
     try discardImpl(self, queue, id);
 }
 
-
 fn insertEventOnConn(alloc: std.mem.Allocator, c: *pg.Conn, job_id: i64, event_type: []const u8, data_json: []const u8) !void {
-var idbuf: [24]u8 = undefined;
-const idstr = try std.fmt.bufPrint(&idbuf, "{d}", .{job_id});
-var rows = try c.query(SQL_EVENT, &.{ idstr, event_type, data_json });
-rows.deinit();
-_ = alloc;
+    var idbuf: [24]u8 = undefined;
+    const idstr = try std.fmt.bufPrint(&idbuf, "{d}", .{job_id});
+    var rows = try c.query(SQL_EVENT, &.{ idstr, event_type, data_json });
+    rows.deinit();
+    _ = alloc;
 }
 
 fn enqueueCore(alloc: std.mem.Allocator, c: *pg.Conn, kind: []const u8, args_json: []const u8, opts: b.EnqueueOptions, out: *b.Enqueued) !void {
-if (opts.unique == .replace) return error.UnsupportedUnique;
-var pbuf: [3][24]u8 = undefined;
-const pri = try std.fmt.bufPrint(&pbuf[0], "{d}", .{opts.priority});
-const rat = try std.fmt.bufPrint(&pbuf[1], "{d}", .{opts.run_at_ms});
-const ma = try std.fmt.bufPrint(&pbuf[2], "{d}", .{opts.max_attempts});
-const params = [_]?[]const u8{ opts.queue, kind, args_json, pri, rat, ma, opts.unique_key, opts.dedup_run_id, opts.context_json };
+    if (opts.unique == .replace) return error.UnsupportedUnique;
+    var pbuf: [3][24]u8 = undefined;
+    const pri = try std.fmt.bufPrint(&pbuf[0], "{d}", .{opts.priority});
+    const rat = try std.fmt.bufPrint(&pbuf[1], "{d}", .{opts.run_at_ms});
+    const ma = try std.fmt.bufPrint(&pbuf[2], "{d}", .{opts.max_attempts});
+    const params = [_]?[]const u8{ opts.queue, kind, args_json, pri, rat, ma, opts.unique_key, opts.dedup_run_id, opts.context_json };
 
-const deduped_sql = opts.dedup_run_id != null;
-const maybe_id: ?i64 = blk: {
-    var rows = try c.query(if (deduped_sql) SQL_INSERT_DEDUP else SQL_INSERT_UNIQUE, &params);
-    defer rows.deinit();
-    if (rows.rows.len == 0) break :blk null;
-    break :blk try Pg.intCell(i64, rows.rows[0], 0);
-};
-
-if (maybe_id) |id| {
-    const quoted_queue = try quoteJsonAlloc(alloc, opts.queue);
-    defer alloc.free(quoted_queue);
-    var evbuf: [256]u8 = undefined;
-    const evdata = try std.fmt.bufPrint(&evbuf, "{{\"queue\":{s}}}", .{quoted_queue});
-    try insertEventOnConn(alloc, c, id, "enqueued", evdata);
-    out.* = .{ .id = id, .deduped = false, .replaced = false };
-} else {
-    const existing: i64 = if (deduped_sql) blk: {
-        var lr = try c.query(SQL_LOOKUP_DEDUP, &.{ kind, opts.dedup_run_id });
-        defer lr.deinit();
-        break :blk if (lr.rows.len > 0) try Pg.intCell(i64, lr.rows[0], 0) else 0;
-    } else blk: {
-        var lr = try c.query(SQL_LOOKUP_UNIQUE, &.{ opts.queue, kind, opts.unique_key });
-        defer lr.deinit();
-        break :blk if (lr.rows.len > 0) try Pg.intCell(i64, lr.rows[0], 0) else 0;
+    const deduped_sql = opts.dedup_run_id != null;
+    const maybe_id: ?i64 = blk: {
+        var rows = try c.query(if (deduped_sql) SQL_INSERT_DEDUP else SQL_INSERT_UNIQUE, &params);
+        defer rows.deinit();
+        if (rows.rows.len == 0) break :blk null;
+        break :blk try Pg.intCell(i64, rows.rows[0], 0);
     };
-    out.* = .{ .id = existing, .deduped = true, .replaced = false };
-}
+
+    if (maybe_id) |id| {
+        const quoted_queue = try quoteJsonAlloc(alloc, opts.queue);
+        defer alloc.free(quoted_queue);
+        var evbuf: [256]u8 = undefined;
+        const evdata = try std.fmt.bufPrint(&evbuf, "{{\"queue\":{s}}}", .{quoted_queue});
+        try insertEventOnConn(alloc, c, id, "enqueued", evdata);
+        out.* = .{ .id = id, .deduped = false, .replaced = false };
+    } else {
+        const existing: i64 = if (deduped_sql) blk: {
+            var lr = try c.query(SQL_LOOKUP_DEDUP, &.{ kind, opts.dedup_run_id });
+            defer lr.deinit();
+            break :blk if (lr.rows.len > 0) try Pg.intCell(i64, lr.rows[0], 0) else 0;
+        } else blk: {
+            var lr = try c.query(SQL_LOOKUP_UNIQUE, &.{ opts.queue, kind, opts.unique_key });
+            defer lr.deinit();
+            break :blk if (lr.rows.len > 0) try Pg.intCell(i64, lr.rows[0], 0) else 0;
+        };
+        out.* = .{ .id = existing, .deduped = true, .replaced = false };
+    }
 }
 
 /// Enqueue a job on the caller's already-open transaction (`conn`). The
@@ -783,9 +782,8 @@ if (maybe_id) |id| {
 /// enqueued-event insert on that connection. This is the transactional
 /// outbox primitive (architecture.md 6.5).
 pub fn enqueueInTx(conn: *pg.Conn, alloc: std.mem.Allocator, kind: []const u8, args_json: []const u8, opts: b.EnqueueOptions, out: *b.Enqueued) !void {
-try enqueueCore(alloc, conn, kind, args_json, opts, out);
+    try enqueueCore(alloc, conn, kind, args_json, opts, out);
 }
-
 
 fn quoteJsonAlloc(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
     var out = std.ArrayList(u8).init(alloc);
