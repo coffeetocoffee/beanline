@@ -220,35 +220,87 @@ pub const Server = struct {
     }
 
     const Actor = struct {
-        user_idx: ?usize,
-        is_key: bool,
+        user_idx: ?usize = null,
+        /// Present for API keys; null for a session, which carries every scope.
+        scopes: ?[3]bool = null,
+
+        fn isAuthed(self: Actor) bool {
+            return self.user_idx != null or self.scopes != null;
+        }
+
+        fn isSession(self: Actor) bool {
+            return self.user_idx != null;
+        }
     };
 
-    /// Authenticate a request. Returns the actor, or null for anonymous.
+    const Need = enum { read, write, control };
+
+    /// Authenticate a request. Returns an empty actor for anonymous requests.
     /// UI routes need a session cookie; API routes accept either.
     fn authenticate(self: *Server, req: *http.Server.Request) Actor {
         if (headerVal(req, "authorization")) |h| {
-            if (self.auth.checkKey(h, .jobs_read)) |_| {
-                return .{ .user_idx = null, .is_key = true };
-            } else |_| {}
+            if (self.auth.keyScopes(h)) |scopes| return .{ .scopes = scopes };
         }
         if (cookieVal(req, "beanline_session")) |c| {
             var tok: [32]u8 = undefined;
             if (parseHexToken(c, &tok)) {
                 var csrf: [32]u8 = undefined;
                 if (self.auth.checkSession(&tok, &csrf)) |idx| {
-                    return .{ .user_idx = idx, .is_key = false };
+                    return .{ .user_idx = idx };
                 } else |_| {}
             }
         }
-        return .{ .user_idx = null, .is_key = false };
+        return .{};
     }
 
-    fn requireRead(self: *Server, actor: Actor) bool {
-        _ = self;
-        _ = actor;
-        // Reads are open when no users/keys are configured; otherwise require auth.
-        return true;
+    fn openReads(self: *Server) bool {
+        return self.auth.users.items.len == 0 and self.auth.keys.items.len == 0 and !self.auth.oidcEnabled();
+    }
+
+    /// Cookie-authenticated mutations must carry the matching CSRF token.
+    fn csrfOk(self: *Server, req: *http.Server.Request) bool {
+        const sess = cookieVal(req, "beanline_session") orelse return true;
+        const csrf_h = headerVal(req, "x-csrf-token") orelse return false;
+        var tok: [32]u8 = undefined;
+        if (!parseHexToken(sess, &tok)) return false;
+        return self.auth.checkCsrf(&tok, csrf_h);
+    }
+
+    /// The single authorization policy. Reads are open when nothing is
+    /// configured; writes need `jobs_write` (or an admin session) and queue
+    /// control needs `queues_control`. Readonly blocks every mutation.
+    fn authorized(self: *Server, actor: Actor, need: Need) bool {
+        const open = self.openReads();
+        switch (need) {
+            .read => {
+                if (open) return true;
+                if (actor.scopes) |s| {
+                    return s[@intFromEnum(auth_mod.Scope.jobs_read)] or s[@intFromEnum(auth_mod.Scope.jobs_write)];
+                }
+                return actor.user_idx != null;
+            },
+            .write, .control => {
+                if (self.auth.readonly) return false;
+                if (actor.scopes) |s| {
+                    const scope: auth_mod.Scope = if (need == .write) .jobs_write else .queues_control;
+                    return s[@intFromEnum(scope)];
+                }
+                if (actor.user_idx) |idx| return self.auth.canMutate(idx);
+                return open;
+            },
+        }
+    }
+
+    /// Queue pause/resume are the only control-scoped routes; everything else
+    /// under `/api/` is a read. A control-only key must not be rejected by the
+    /// read gate before `handleAPI` can check its scope.
+    fn apiNeed(path: []const u8) Need {
+        if (std.mem.startsWith(u8, path, "/api/queues/")) {
+            const end = std.mem.indexOfScalar(u8, path, '?') orelse path.len;
+            const rest = path["/api/queues/".len..end];
+            if (std.mem.indexOfScalar(u8, rest, '/') != null) return .control;
+        }
+        return .read;
     }
 
     fn route(self: *Server, req: *http.Server.Request) !void {
@@ -310,12 +362,21 @@ pub const Server = struct {
             try self.handleOidcCallback(req, path);
             return;
         }
-        if (std.mem.eql(u8, path, "/api/live")) {
-            try self.handleSSE(req);
-            return;
-        }
-        if (std.mem.startsWith(u8, path, "/api/")) {
-            try self.handleAPI(req, path, method);
+        if (std.mem.eql(u8, path, "/api/live") or std.mem.startsWith(u8, path, "/api/")) {
+            const actor = self.authenticate(req);
+            if (!self.authorized(actor, apiNeed(path))) {
+                if (actor.isAuthed()) {
+                    try self.jsonResponse(req, .forbidden, "{\"error\":\"forbidden\"}", &.{});
+                } else {
+                    try self.jsonResponse(req, .unauthorized, "{\"error\":\"unauthorized\"}", &.{});
+                }
+                return;
+            }
+            if (std.mem.eql(u8, path, "/api/live")) {
+                try self.handleSSE(req);
+            } else {
+                try self.handleAPI(req, actor, path, method);
+            }
             return;
         }
         try self.respondStatus(req, .not_found, "not_found");
@@ -536,16 +597,7 @@ pub const Server = struct {
         res.end() catch {};
     }
 
-    fn handleAPI(self: *Server, req: *http.Server.Request, path: []const u8, method: http.Method) !void {
-        const actor = self.authenticate(req);
-        const authed = actor.user_idx != null or actor.is_key;
-        const open_reads = self.auth.users.items.len == 0 and self.auth.keys.items.len == 0 and !self.auth.oidcEnabled();
-        if (!open_reads and !authed) {
-            try self.jsonResponse(req, .unauthorized, "{\"error\":\"unauthorized\"}", &.{});
-            return;
-        }
-        _ = self.requireRead(actor);
-
+    fn handleAPI(self: *Server, req: *http.Server.Request, actor: Actor, path: []const u8, method: http.Method) !void {
         if (std.mem.eql(u8, path, "/api/queues") and method == .GET) {
             const body = self.rest.queues(self.queue_names) catch {
                 try self.respondStatus(req, .internal_server_error, "broker_error");
@@ -553,6 +605,53 @@ pub const Server = struct {
             };
             defer self.alloc.free(body);
             try self.jsonResponse(req, .ok, body, &.{});
+            return;
+        }
+        if (std.mem.startsWith(u8, path, "/api/queues/")) {
+            if (method != .POST) {
+                try self.respondStatus(req, .method_not_allowed, "method_not_allowed");
+                return;
+            }
+            if (!self.authorized(actor, .control)) {
+                try self.jsonResponse(req, .forbidden, "{\"error\":\"forbidden\"}", &.{});
+                return;
+            }
+            if (actor.isSession() and !self.csrfOk(req)) {
+                try self.jsonResponse(req, .forbidden, "{\"error\":\"bad_csrf\"}", &.{});
+                return;
+            }
+            const tail = path["/api/queues/".len..];
+            const slash = std.mem.indexOfScalar(u8, tail, '/') orelse {
+                try self.respondStatus(req, .not_found, "unknown_action");
+                return;
+            };
+            const name = tail[0..slash];
+            var action = tail[slash + 1 ..];
+            if (std.mem.indexOfScalar(u8, action, '?')) |qm| action = action[0..qm];
+            if (name.len == 0) {
+                try self.respondStatus(req, .not_found, "unknown_action");
+                return;
+            }
+            const paused = if (std.mem.eql(u8, action, "pause"))
+                true
+            else if (std.mem.eql(u8, action, "resume"))
+                false
+            else {
+                try self.respondStatus(req, .not_found, "unknown_action");
+                return;
+            };
+            const body = self.rest.setQueuePaused(name, paused) catch {
+                try self.respondStatus(req, .internal_server_error, "broker_error");
+                return;
+            };
+            defer self.alloc.free(body);
+            const code: http.Status = if (std.mem.indexOf(u8, body, "\"code\":501") != null)
+                .not_implemented
+            else if (std.mem.indexOf(u8, body, "\"code\":500") != null)
+                .internal_server_error
+            else
+                .ok;
+            try self.jsonResponse(req, code, body, &.{});
             return;
         }
         if (std.mem.startsWith(u8, path, "/api/jobs")) {
@@ -597,22 +696,14 @@ pub const Server = struct {
                 try self.respondStatus(req, .method_not_allowed, "method_not_allowed");
                 return;
             }
-            if (!authed or (actor.user_idx != null and !self.auth.canMutate(actor.user_idx.?))) {
-                if (!self.auth.readonly and open_reads) {} else {
-                    try self.jsonResponse(req, .forbidden, "{\"error\":\"forbidden\"}", &.{});
-                    return;
-                }
+            if (!self.authorized(actor, .write)) {
+                try self.jsonResponse(req, .forbidden, "{\"error\":\"forbidden\"}", &.{});
+                return;
             }
             // CSRF check for cookie-authed mutations.
-            if (!actor.is_key) {
-                if (cookieVal(req, "beanline_session")) |sess| {
-                    const csrf_h = headerVal(req, "x-csrf-token") orelse "";
-                    var tok: [32]u8 = undefined;
-                    if (!parseHexToken(sess, &tok) or !self.auth.checkCsrf(&tok, csrf_h)) {
-                        try self.jsonResponse(req, .forbidden, "{\"error\":\"bad_csrf\"}", &.{});
-                        return;
-                    }
-                }
+            if (actor.isSession() and !self.csrfOk(req)) {
+                try self.jsonResponse(req, .forbidden, "{\"error\":\"bad_csrf\"}", &.{});
+                return;
             }
             var queue: []const u8 = "default";
             const qbody = req.reader() catch null;
@@ -667,11 +758,13 @@ pub const Server = struct {
             return;
         }
         if (std.mem.eql(u8, path, "/api/enqueue") and method == .POST) {
-            if (!authed or (actor.user_idx != null and !self.auth.canMutate(actor.user_idx.?))) {
-                if (!(!self.auth.readonly and open_reads)) {
-                    try self.jsonResponse(req, .forbidden, "{\"error\":\"forbidden\"}", &.{});
-                    return;
-                }
+            if (!self.authorized(actor, .write)) {
+                try self.jsonResponse(req, .forbidden, "{\"error\":\"forbidden\"}", &.{});
+                return;
+            }
+            if (actor.isSession() and !self.csrfOk(req)) {
+                try self.jsonResponse(req, .forbidden, "{\"error\":\"bad_csrf\"}", &.{});
+                return;
             }
             const rdr = req.reader() catch {
                 try self.respondStatus(req, .bad_request, "bad_body");

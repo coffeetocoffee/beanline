@@ -137,6 +137,11 @@ pub const VTable = struct {
     queue_names: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) anyerror!void = null,
     retry: ?*const fn (ctx: *anyopaque, queue: []const u8, id: i64) anyerror!void = null,
     discard: ?*const fn (ctx: *anyopaque, queue: []const u8, id: i64) anyerror!void = null,
+    // Optional operator control. Pause must persist in the broker so it is
+    // visible to workers in other processes; claim skips paused queues.
+    pause_queue: ?*const fn (ctx: *anyopaque, queue: []const u8) anyerror!void = null,
+    resume_queue: ?*const fn (ctx: *anyopaque, queue: []const u8) anyerror!void = null,
+    queue_paused: ?*const fn (ctx: *anyopaque, queue: []const u8) anyerror!bool = null,
 };
 
 pub const Broker = struct {
@@ -226,6 +231,21 @@ pub const Broker = struct {
     pub fn discard(self: Broker, queue: []const u8, id: i64) anyerror!void {
         const f = self.vtable.discard orelse return error.Unsupported;
         return f(self.ptr, queue, id);
+    }
+
+    pub fn pauseQueue(self: Broker, queue: []const u8) anyerror!void {
+        const f = self.vtable.pause_queue orelse return error.Unsupported;
+        return f(self.ptr, queue);
+    }
+
+    pub fn resumeQueue(self: Broker, queue: []const u8) anyerror!void {
+        const f = self.vtable.resume_queue orelse return error.Unsupported;
+        return f(self.ptr, queue);
+    }
+
+    pub fn queuePaused(self: Broker, queue: []const u8) anyerror!bool {
+        const f = self.vtable.queue_paused orelse return error.Unsupported;
+        return f(self.ptr, queue);
     }
 };
 

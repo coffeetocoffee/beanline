@@ -308,21 +308,34 @@ pub const Auth = struct {
         return std.mem.eql(u8, &expected, csrf);
     }
 
-    /// Validate an API key from the Authorization header. Format:
+    /// Look up an API key by Authorization header. Format:
     /// "Bearer <prefix>.<secret>".
-    pub fn checkKey(self: *Auth, header: []const u8, need: Scope) !void {
-        if (!std.mem.startsWith(u8, header, "Bearer ")) return error.Unauthorized;
+    fn findKey(self: *Auth, header: []const u8) ?*const ApiKey {
+        if (!std.mem.startsWith(u8, header, "Bearer ")) return null;
         const rest = header["Bearer ".len..];
-        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return error.Unauthorized;
+        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
         const prefix = rest[0..dot];
         const secret = rest[dot + 1 ..];
-        for (self.keys.items) |k| {
-            if (std.mem.eql(u8, k.prefix, prefix) and std.mem.eql(u8, k.key, secret)) {
-                if (!k.has(need) and !k.has(.jobs_write)) return error.Forbidden;
-                return;
-            }
+        for (self.keys.items) |*k| {
+            if (std.mem.eql(u8, k.prefix, prefix) and std.mem.eql(u8, k.key, secret)) return k;
         }
-        return error.Unauthorized;
+        return null;
+    }
+
+    /// Scopes granted by the key in `header`, or null when no key matches.
+    /// Returned by value so callers can hold it across list mutations.
+    pub fn keyScopes(self: *Auth, header: []const u8) ?[3]bool {
+        const k = self.findKey(header) orelse return null;
+        return k.scopes;
+    }
+
+    /// Validate an API key from the Authorization header. `jobs_write` implies
+    /// `jobs_read`; no scope implies `queues_control`.
+    pub fn checkKey(self: *Auth, header: []const u8, need: Scope) !void {
+        const k = self.findKey(header) orelse return error.Unauthorized;
+        if (k.has(need)) return;
+        if (need == .jobs_read and k.has(.jobs_write)) return;
+        return error.Forbidden;
     }
 
     /// Can this user perform mutations? Viewers are read-only regardless of
@@ -617,6 +630,17 @@ test "api key scopes" {
     try std.testing.expectError(error.Forbidden, a.checkKey("Bearer k1.sekret", .queues_control));
     try std.testing.expectError(error.Unauthorized, a.checkKey("Bearer k1.nope", .jobs_read));
     try std.testing.expectError(error.Unauthorized, a.checkKey("nope", .jobs_read));
+}
+
+test "jobs_write implies read but not queue control" {
+    var a = Auth.init(std.testing.allocator, "s", false);
+    defer a.deinit();
+    try a.addKey("w:sekret:jobs_write");
+    try a.checkKey("Bearer w.sekret", .jobs_read);
+    try a.checkKey("Bearer w.sekret", .jobs_write);
+    try std.testing.expectError(error.Forbidden, a.checkKey("Bearer w.sekret", .queues_control));
+    try std.testing.expect(a.keyScopes("Bearer w.sekret") != null);
+    try std.testing.expect(a.keyScopes("Bearer w.nope") == null);
 }
 
 test "viewer cannot mutate" {

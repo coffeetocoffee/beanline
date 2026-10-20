@@ -8,10 +8,13 @@ Prometheus endpoint on one port (default `127.0.0.1:9484`).
 | Surface | Credential |
 |---|---|
 | UI (`/`, `/login`) | Session cookie (`beanline_session`) plus `x-csrf-token` on POSTs |
-| `/api/*` | Session cookie, or `Authorization: Bearer <prefix>.<secret>` |
+| `/api/*` (including `/api/live`) | Session cookie, or `Authorization: Bearer <prefix>.<secret>` |
 | `/metrics`, `/healthz`, `/readyz` | Open |
 
-API keys carry scopes: `jobs_read`, `jobs_write`, `queues_control`.
+API keys carry scopes: `jobs_read`, `jobs_write`, `queues_control`. Reads
+require `jobs_read` (a `jobs_write` key may also read); `POST /api/enqueue` and
+the job action endpoints require `jobs_write`; queue control requires
+`queues_control`. Queue control alone grants no reads.
 
 ## Endpoints
 
@@ -27,9 +30,14 @@ API keys carry scopes: `jobs_read`, `jobs_write`, `queues_control`.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/queues` | Depth and state per queue. |
-| POST | `/api/queues/{name}/pause` | Stop claiming from a queue. |
-| POST | `/api/queues/{name}/resume` | Resume claiming. |
+| GET | `/api/queues` | Depth, state, and `paused` flag per queue. |
+| POST | `/api/queues/{name}/pause` | Stop claiming from a queue. Scope `queues_control`. |
+| POST | `/api/queues/{name}/resume` | Resume claiming. Scope `queues_control`. |
+
+Pause state is stored in the broker (Postgres table `beanline_queue_state` or
+the Redis key `beanline:{<queue>}:paused`), so it applies to every worker
+process, not just the dashboard. Paused queues keep accepting enqueues; claims
+simply return nothing until resumed.
 
 ### Jobs
 
@@ -59,13 +67,15 @@ job id alone is ambiguous (Redis mode keys jobs per queue).
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/schedules` | List configured schedules. |
-| POST | `/api/schedules/{id}/run` | Fire a schedule now. |
+
+Schedules live in the worker process, not the broker, so the server tier
+cannot address them by id: there is no run-now endpoint.
 
 ### Live stream
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/live?queue={name}` | Server-sent events: claim, complete, dead. |
+| GET | `/api/live?queue={name}` | Server-sent events: claim, complete, dead. Requires `jobs_read`. |
 
 ### Session
 
@@ -88,6 +98,7 @@ job id alone is ambiguous (Redis mode keys jobs per queue).
 | 409 | Conflict (for example, cancelling a job that already finished) |
 | 429 | Login lockout after repeated failures |
 | 500 | Broker or internal error |
+| 501 | Queue control not supported by the configured broker |
 | 503 | `broker_down` |
 
 ## Examples

@@ -56,14 +56,32 @@ pub const Rest = struct {
             self.broker.depth(q, &d) catch {
                 d = .{};
             };
+            const paused = self.broker.queuePaused(q) catch false;
             const esc = try self.escapeJson(q);
             defer self.alloc.free(esc);
-            try w.print("{{\"name\":\"{s}\",\"available\":{d},\"scheduled\":{d},\"running\":{d},\"dead\":{d},\"completed\":{d},\"cancelled\":{d},\"oldest_available_ms\":{d}}}", .{
-                esc, d.available, d.scheduled, d.running, d.dead, d.completed, d.cancelled, d.oldest_available_ms,
+            try w.print("{{\"name\":\"{s}\",\"available\":{d},\"scheduled\":{d},\"running\":{d},\"dead\":{d},\"completed\":{d},\"cancelled\":{d},\"oldest_available_ms\":{d},\"paused\":{s}}}", .{
+                esc, d.available, d.scheduled, d.running, d.dead, d.completed, d.cancelled, d.oldest_available_ms, if (paused) "true" else "false",
             });
         }
         try w.writeAll("]}");
         return out.toOwnedSlice();
+    }
+
+    fn queueCtlError(self: *Rest, e: anyerror) ![]u8 {
+        if (e == error.Unsupported) return self.errJson(501, "not_supported");
+        return self.errJson(500, @errorName(e));
+    }
+
+    /// POST /api/queues/{name}/pause and /resume — durable across processes.
+    pub fn setQueuePaused(self: *Rest, queue: []const u8, paused: bool) ![]u8 {
+        if (paused) {
+            self.broker.pauseQueue(queue) catch |e| return self.queueCtlError(e);
+        } else {
+            self.broker.resumeQueue(queue) catch |e| return self.queueCtlError(e);
+        }
+        const esc = try self.escapeJson(queue);
+        defer self.alloc.free(esc);
+        return std.fmt.allocPrint(self.alloc, "{{\"ok\":true,\"queue\":\"{s}\",\"paused\":{s}}}", .{ esc, if (paused) "true" else "false" });
     }
 
     /// GET /api/jobs?status=&kind=&queue=&limit=&offset=

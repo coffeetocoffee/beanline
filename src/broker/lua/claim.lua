@@ -4,6 +4,9 @@ local now = tonumber(ARGV[3])
 local lease = tonumber(ARGV[4])
 local n = tonumber(ARGV[5])
 local prefix = 'beanline:{' .. q .. '}'
+if redis.call('EXISTS', prefix .. ':paused') == 1 then
+  return {}
+end
 local delayed = redis.call('ZRANGEBYSCORE', prefix .. ':delayed', '-inf', now, 'LIMIT', 0, n)
 for _, id in ipairs(delayed) do
   local jk = prefix .. ':job:' .. id

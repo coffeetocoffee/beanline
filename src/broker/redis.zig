@@ -658,6 +658,31 @@ fn discardImpl(self: *Redis, queue: []const u8, id: i64) !void {
     if ((try v.asInt()) == 0) return error.NotFound;
 }
 
+fn pauseQueueImpl(self: *Redis, queue: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const key = try std.fmt.allocPrint(al, "beanline:{{{s}}}:paused", .{queue});
+    _ = try self.c.command(al, &.{ "SET", key, "1" });
+}
+
+fn resumeQueueImpl(self: *Redis, queue: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const key = try std.fmt.allocPrint(al, "beanline:{{{s}}}:paused", .{queue});
+    _ = try self.c.command(al, &.{ "DEL", key });
+}
+
+fn queuePausedImpl(self: *Redis, queue: []const u8) !bool {
+    var arena = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const key = try std.fmt.allocPrint(al, "beanline:{{{s}}}:paused", .{queue});
+    const v = try self.c.command(al, &.{ "EXISTS", key });
+    return (try v.asInt()) != 0;
+}
+
 fn listJobsCb(ctx: *anyopaque, alloc: std.mem.Allocator, filter: b.JobFilter, out: *std.ArrayList(b.JobRow)) anyerror!void {
     const self: *Redis = @ptrCast(@alignCast(ctx));
     self.mu.lock();
@@ -700,6 +725,27 @@ fn discardCb(ctx: *anyopaque, queue: []const u8, id: i64) anyerror!void {
     try discardImpl(self, queue, id);
 }
 
+fn pauseQueueCb(ctx: *anyopaque, queue: []const u8) anyerror!void {
+    const self: *Redis = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    try pauseQueueImpl(self, queue);
+}
+
+fn resumeQueueCb(ctx: *anyopaque, queue: []const u8) anyerror!void {
+    const self: *Redis = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    try resumeQueueImpl(self, queue);
+}
+
+fn queuePausedCb(ctx: *anyopaque, queue: []const u8) anyerror!bool {
+    const self: *Redis = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    return queuePausedImpl(self, queue);
+}
+
 pub const vtable = b.VTable{
     .enqueue = enqueueCb,
     .claim = claimCb,
@@ -718,6 +764,9 @@ pub const vtable = b.VTable{
     .queue_names = queueNamesCb,
     .retry = retryCb,
     .discard = discardCb,
+    .pause_queue = pauseQueueCb,
+    .resume_queue = resumeQueueCb,
+    .queue_paused = queuePausedCb,
 };
 
 pub fn open(alloc: std.mem.Allocator, url_str: []const u8) !*Redis {

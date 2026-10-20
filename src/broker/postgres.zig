@@ -49,6 +49,7 @@ const SQL_CLAIM =
     \\WITH batch AS (
     \\  SELECT id FROM beanline_jobs
     \\  WHERE queue = $1 AND status = 'available' AND run_at <= now()
+    \\    AND NOT EXISTS (SELECT 1 FROM beanline_queue_state s WHERE s.queue = $1 AND s.paused)
     \\  ORDER BY priority, run_at
     \\  FOR UPDATE SKIP LOCKED
     \\  LIMIT $2
@@ -513,6 +514,20 @@ const SQL_EVENTS =
 
 const SQL_QUEUE_NAMES = "SELECT DISTINCT queue FROM beanline_jobs ORDER BY queue";
 
+const SQL_PAUSE_QUEUE =
+    \\INSERT INTO beanline_queue_state (queue, paused, changed_at)
+    \\VALUES ($1, true, now())
+    \\ON CONFLICT (queue) DO UPDATE SET paused = true, changed_at = now()
+;
+
+const SQL_RESUME_QUEUE =
+    \\INSERT INTO beanline_queue_state (queue, paused, changed_at)
+    \\VALUES ($1, false, now())
+    \\ON CONFLICT (queue) DO UPDATE SET paused = false, changed_at = now()
+;
+
+const SQL_QUEUE_PAUSED = "SELECT paused FROM beanline_queue_state WHERE queue = $1";
+
 const SQL_RETRY =
     \\UPDATE beanline_jobs SET status = 'available', run_at = now(),
     \\  attempts = 0, lock_expires_at = NULL
@@ -690,6 +705,24 @@ fn discardImpl(self: *Pg, queue: []const u8, id: i64) !void {
     try self.insertEvent(id, "discarded_by_operator", "{}");
 }
 
+fn pauseQueueImpl(self: *Pg, queue: []const u8) !void {
+    var rows = try self.c.query(SQL_PAUSE_QUEUE, &.{queue});
+    rows.deinit();
+}
+
+fn resumeQueueImpl(self: *Pg, queue: []const u8) !void {
+    var rows = try self.c.query(SQL_RESUME_QUEUE, &.{queue});
+    rows.deinit();
+}
+
+fn queuePausedImpl(self: *Pg, queue: []const u8) !bool {
+    var rows = try self.c.query(SQL_QUEUE_PAUSED, &.{queue});
+    defer rows.deinit();
+    if (rows.rows.len == 0) return false;
+    const v = try Pg.textCell(rows.rows[0], 0);
+    return v.len > 0 and (v[0] == 't' or v[0] == 'T' or v[0] == '1');
+}
+
 fn listJobsCb(ctx: *anyopaque, alloc: std.mem.Allocator, filter: b.JobFilter, out: *std.ArrayList(b.JobRow)) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
     self.mu.lock();
@@ -730,6 +763,27 @@ fn discardCb(ctx: *anyopaque, queue: []const u8, id: i64) anyerror!void {
     self.mu.lock();
     defer self.mu.unlock();
     try discardImpl(self, queue, id);
+}
+
+fn pauseQueueCb(ctx: *anyopaque, queue: []const u8) anyerror!void {
+    const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    try pauseQueueImpl(self, queue);
+}
+
+fn resumeQueueCb(ctx: *anyopaque, queue: []const u8) anyerror!void {
+    const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    try resumeQueueImpl(self, queue);
+}
+
+fn queuePausedCb(ctx: *anyopaque, queue: []const u8) anyerror!bool {
+    const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    return queuePausedImpl(self, queue);
 }
 
 fn insertEventOnConn(alloc: std.mem.Allocator, c: *pg.Conn, job_id: i64, event_type: []const u8, data_json: []const u8) !void {
@@ -826,6 +880,9 @@ pub const vtable = b.VTable{
     .queue_names = queueNamesCb,
     .retry = retryCb,
     .discard = discardCb,
+    .pause_queue = pauseQueueCb,
+    .resume_queue = resumeQueueCb,
+    .queue_paused = queuePausedCb,
 };
 
 pub fn open(alloc: std.mem.Allocator, dsn: []const u8) !*Pg {

@@ -6,6 +6,9 @@ const server_mod = @import("server.zig");
 const metrics_mod = @import("../obs/metrics.zig");
 const logs_mod = @import("../obs/logs.zig");
 
+/// Queue pause is per-broker state; a file-level flag is enough for the mock.
+var mock_paused: bool = false;
+
 const Mock = struct {
     fn enqueueCb(_: *anyopaque, _: []const u8, _: []const u8, _: broker_mod.EnqueueOptions, out: *broker_mod.Enqueued) anyerror!void {
         out.* = .{ .id = 7 };
@@ -32,6 +35,15 @@ const Mock = struct {
         return .{ .transactional_enqueue = false, .pubsub_wakeups = false, .named_backend = "mock" };
     }
     fn deinitCb(_: *anyopaque) void {}
+    fn pauseQueueCb(_: *anyopaque, _: []const u8) anyerror!void {
+        mock_paused = true;
+    }
+    fn resumeQueueCb(_: *anyopaque, _: []const u8) anyerror!void {
+        mock_paused = false;
+    }
+    fn queuePausedCb(_: *anyopaque, _: []const u8) anyerror!bool {
+        return mock_paused;
+    }
     const vt = broker_mod.VTable{
         .enqueue = enqueueCb,
         .claim = claimCb,
@@ -44,6 +56,9 @@ const Mock = struct {
         .depth = depthCb,
         .capabilities = capabilitiesCb,
         .deinit = deinitCb,
+        .pause_queue = pauseQueueCb,
+        .resume_queue = resumeQueueCb,
+        .queue_paused = queuePausedCb,
     };
 };
 
@@ -276,5 +291,217 @@ test "live http smoke: healthz, api, auth gate, metrics" {
         defer alloc.free(r.body);
         try std.testing.expectEqual(std.http.Status.ok, r.status);
         try std.testing.expect(std.mem.indexOf(u8, r.body, "\"id\":7") != null);
+    }
+}
+
+test "api authorization matrix: scopes gate reads, writes, and the event stream" {
+    const alloc = std.testing.allocator;
+    var m: u8 = 0;
+    const br = broker_mod.Broker{ .ptr = &m, .vtable = &Mock.vt };
+    var auth = auth_mod.Auth.init(alloc, "testsecret", false);
+    defer auth.deinit();
+    try auth.addUser("ops:hunter2:admin");
+    try auth.addKey("rk:readsecret:jobs_read");
+    try auth.addKey("wk:writesecret:jobs_write");
+    try auth.addKey("ck:controlsecret:queues_control");
+    var bus = sse_mod.Bus.init(alloc);
+    defer bus.deinit();
+    var metrics = metrics_mod.Metrics.init(alloc);
+    defer metrics.deinit();
+    var log = logs_mod.Logger.init(std.io.getStdErr());
+
+    const port: u16 = 19486;
+    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19486", false);
+    try srv.start();
+    defer srv.stopServer();
+    std.time.sleep(150 * std.time.ns_per_ms);
+
+    const read_key = [_]std.http.Header{.{ .name = "authorization", .value = "Bearer rk.readsecret" }};
+    const write_key = [_]std.http.Header{.{ .name = "authorization", .value = "Bearer wk.writesecret" }};
+    const control_key = [_]std.http.Header{.{ .name = "authorization", .value = "Bearer ck.controlsecret" }};
+    const payload = "{\"kind\":\"emails.send\",\"args\":{}}";
+
+    // Anonymous: reads, writes, and the event stream all require auth.
+    {
+        const r = try get(alloc, port, "/api/queues", &.{});
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.unauthorized, r.status);
+    }
+    {
+        const r = try get(alloc, port, "/api/live", &.{});
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.unauthorized, r.status);
+    }
+    {
+        const r = try post(alloc, port, "/api/enqueue", payload, &.{});
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.unauthorized, r.status);
+    }
+    // jobs_read: may read, may not enqueue or retry.
+    {
+        const r = try get(alloc, port, "/api/queues", &read_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.ok, r.status);
+    }
+    {
+        const r = try post(alloc, port, "/api/enqueue", payload, &read_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.forbidden, r.status);
+    }
+    {
+        const r = try post(alloc, port, "/api/jobs/7/retry", "{}", &read_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.forbidden, r.status);
+    }
+    // jobs_write implies jobs_read, and permits enqueue.
+    {
+        const r = try get(alloc, port, "/api/queues", &write_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.ok, r.status);
+    }
+    {
+        const r = try post(alloc, port, "/api/enqueue", payload, &write_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.ok, r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"id\":7") != null);
+    }
+    // queues_control does not grant reads or writes.
+    {
+        const r = try get(alloc, port, "/api/queues", &control_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.forbidden, r.status);
+    }
+    {
+        const r = try get(alloc, port, "/api/live", &control_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.forbidden, r.status);
+    }
+    {
+        const r = try post(alloc, port, "/api/enqueue", payload, &control_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.forbidden, r.status);
+    }
+    // A bad key is treated as anonymous.
+    {
+        const r = try get(alloc, port, "/api/queues", &.{.{ .name = "authorization", .value = "Bearer rk.wrong" }});
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.unauthorized, r.status);
+    }
+}
+
+test "readonly mode blocks api key mutations" {
+    const alloc = std.testing.allocator;
+    var m: u8 = 0;
+    const br = broker_mod.Broker{ .ptr = &m, .vtable = &Mock.vt };
+    var auth = auth_mod.Auth.init(alloc, "testsecret", true);
+    defer auth.deinit();
+    try auth.addKey("wk:writesecret:jobs_write");
+    var bus = sse_mod.Bus.init(alloc);
+    defer bus.deinit();
+    var metrics = metrics_mod.Metrics.init(alloc);
+    defer metrics.deinit();
+    var log = logs_mod.Logger.init(std.io.getStdErr());
+
+    const port: u16 = 19487;
+    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19487", true);
+    try srv.start();
+    defer srv.stopServer();
+    std.time.sleep(150 * std.time.ns_per_ms);
+
+    const write_key = [_]std.http.Header{.{ .name = "authorization", .value = "Bearer wk.writesecret" }};
+    {
+        const r = try get(alloc, port, "/api/queues", &write_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.ok, r.status);
+    }
+    {
+        const r = try post(alloc, port, "/api/enqueue", "{\"kind\":\"emails.send\",\"args\":{}}", &write_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.forbidden, r.status);
+    }
+}
+
+test "queue pause and resume: control scope, method, and reflected state" {
+    const alloc = std.testing.allocator;
+    mock_paused = false;
+    var m: u8 = 0;
+    const br = broker_mod.Broker{ .ptr = &m, .vtable = &Mock.vt };
+    var auth = auth_mod.Auth.init(alloc, "testsecret", false);
+    defer auth.deinit();
+    try auth.addKey("rk:readsecret:jobs_read");
+    try auth.addKey("ck:controlsecret:queues_control");
+    var bus = sse_mod.Bus.init(alloc);
+    defer bus.deinit();
+    var metrics = metrics_mod.Metrics.init(alloc);
+    defer metrics.deinit();
+    var log = logs_mod.Logger.init(std.io.getStdErr());
+
+    const port: u16 = 19488;
+    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19488", false);
+    try srv.start();
+    defer srv.stopServer();
+    std.time.sleep(150 * std.time.ns_per_ms);
+
+    const read_key = [_]std.http.Header{.{ .name = "authorization", .value = "Bearer rk.readsecret" }};
+    const control_key = [_]std.http.Header{.{ .name = "authorization", .value = "Bearer ck.controlsecret" }};
+
+    // Anonymous is gated; jobs_read is not queue control.
+    {
+        const r = try post(alloc, port, "/api/queues/default/pause", "", &.{});
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.unauthorized, r.status);
+    }
+    {
+        const r = try post(alloc, port, "/api/queues/default/pause", "", &read_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.forbidden, r.status);
+    }
+    // The control route is gated on queues_control, even for wrong verbs.
+    {
+        const r = try get(alloc, port, "/api/queues/default/pause", &control_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.method_not_allowed, r.status);
+    }
+    {
+        const r = try get(alloc, port, "/api/queues/default/pause", &read_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.forbidden, r.status);
+    }
+    // Pause flips the state, and GET /api/queues reports it.
+    {
+        const r = try post(alloc, port, "/api/queues/default/pause", "", &control_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.ok, r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"paused\":true") != null);
+    }
+    {
+        const r = try get(alloc, port, "/api/queues", &read_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.ok, r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"paused\":true") != null);
+    }
+    // Resume clears it.
+    {
+        const r = try post(alloc, port, "/api/queues/default/resume", "", &control_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.ok, r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"paused\":false") != null);
+    }
+    {
+        const r = try get(alloc, port, "/api/queues", &read_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.ok, r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"paused\":false") != null);
+    }
+    // Unknown verbs and empty names are 404.
+    {
+        const r = try post(alloc, port, "/api/queues/default/stop", "", &control_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.not_found, r.status);
+    }
+    {
+        const r = try post(alloc, port, "/api/queues//pause", "", &control_key);
+        defer alloc.free(r.body);
+        try std.testing.expectEqual(std.http.Status.not_found, r.status);
     }
 }

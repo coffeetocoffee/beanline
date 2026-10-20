@@ -827,7 +827,7 @@ GET  /api/jobs/{id}                     detail + events
 POST /api/jobs/{id}/retry | discard | cancel
 POST /api/queues/{name}/pause | resume
 POST /api/enqueue                       (token-gated, scope jobs:write)
-GET  /api/schedules                     + POST /api/schedules/{id}/run
+GET  /api/schedules                     worker-local; no run-now endpoint
 GET  /api/live                          SSE
 GET  /metrics                           Prometheus
 GET  /healthz /readyz

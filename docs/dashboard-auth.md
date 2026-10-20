@@ -23,6 +23,11 @@ BEANLINE_DASH_KEYS='opskey:s3cret:jobs_read,jobs_write,queues_control'
 Sent as `Authorization: Bearer <prefix>.<secret>`. Keys bypass CSRF (they are
 not cookies) and are the right choice for automation and Prometheus scraping.
 
+Scopes are enforced on every request. `jobs_read` allows reads; `jobs_write`
+implies `jobs_read` and allows enqueue plus job actions; `queues_control`
+allows queue pause/resume and grants no reads. An unknown or malformed key is
+treated as unauthenticated (`401`); a valid key lacking the scope gets `403`.
+
 ## OIDC SSO (authorization code flow with PKCE)
 
 Set the provider endpoints explicitly; there is no `.well-known` discovery, so
@@ -75,7 +80,7 @@ Design notes:
 
 | Setting | Effect |
 |---|---|
-| `BEANLINE_DASH_READONLY` | All mutations refused, including for admins |
+| `BEANLINE_DASH_READONLY` | All mutations refused, including for admins and API keys |
 | `BEANLINE_DASH_BIND` | Default `127.0.0.1:9484`; a `0.0.0.0` bind with no users, keys, or OIDC is refused at startup |
 | `BEANLINE_DASH_ENABLED` | Serve the dashboard from a worker process (the `server` command always serves it) |
 | `BEANLINE_LOG_PAYLOAD` | Off by default; job args are not logged unless enabled |
