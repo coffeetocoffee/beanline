@@ -89,6 +89,19 @@ jobs:
           kill "$WATCHDOG_PID" 2>/dev/null || true
           exit $STATUS
 
+  fuzz:
+    name: fuzz gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: fuzz target unit tests
+        run: zig build test-fuzz --summary all
+      - name: fuzz gate
+        run: zig build fuzz-gate --summary all
+
   contract:
     name: contract suite (postgres + redis)
     runs-on: ubuntu-latest
