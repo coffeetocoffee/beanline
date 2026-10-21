@@ -462,12 +462,12 @@ pub const Server = struct {
         const cs = hexToken(csrf, &csrf_hex);
         const secure_attr = if (self.secure_cookies) " Secure; " else "";
         var cookie_buf: [256]u8 = undefined;
-        const cookie = std.fmt.bufPrint(&cookie_buf, "beanline_session={s}; Path=/; HttpOnly;{s}SameSite=Strict; Max-Age=86400", .{hs, secure_attr}) catch {
+        const cookie = std.fmt.bufPrint(&cookie_buf, "beanline_session={s}; Path=/; HttpOnly;{s}SameSite=Strict; Max-Age=86400", .{ hs, secure_attr }) catch {
             try self.respondStatus(req, .internal_server_error, "cookie");
             return;
         };
         var csrf_buf: [128]u8 = undefined;
-        const csrf_cookie = std.fmt.bufPrint(&csrf_buf, "beanline_csrf={s}; Path=/;{s}SameSite=Strict; Max-Age=86400", .{cs, secure_attr}) catch {
+        const csrf_cookie = std.fmt.bufPrint(&csrf_buf, "beanline_csrf={s}; Path=/;{s}SameSite=Strict; Max-Age=86400", .{ cs, secure_attr }) catch {
             try self.respondStatus(req, .internal_server_error, "cookie");
             return;
         };
@@ -582,12 +582,12 @@ pub const Server = struct {
         const cs = hexToken(csrf, &csrf_hex);
         const secure_attr = if (self.secure_cookies) " Secure; " else "";
         var cookie_buf: [256]u8 = undefined;
-        const cookie = std.fmt.bufPrint(&cookie_buf, "beanline_session={s}; Path=/; HttpOnly;{s}SameSite=Strict; Max-Age=86400", .{hs, secure_attr}) catch {
+        const cookie = std.fmt.bufPrint(&cookie_buf, "beanline_session={s}; Path=/; HttpOnly;{s}SameSite=Strict; Max-Age=86400", .{ hs, secure_attr }) catch {
             try self.respondStatus(req, .internal_server_error, "cookie");
             return;
         };
         var csrf_buf: [128]u8 = undefined;
-        const csrf_cookie = std.fmt.bufPrint(&csrf_buf, "beanline_csrf={s}; Path=/;{s}SameSite=Strict; Max-Age=86400", .{cs, secure_attr}) catch {
+        const csrf_cookie = std.fmt.bufPrint(&csrf_buf, "beanline_csrf={s}; Path=/;{s}SameSite=Strict; Max-Age=86400", .{ cs, secure_attr }) catch {
             try self.respondStatus(req, .internal_server_error, "cookie");
             return;
         };
