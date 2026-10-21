@@ -30,7 +30,7 @@ local function compute_ttl(run_at_ms, now_ms, grace_sec)
     end
     -- Ensure integer TTL (Redis EX requires integer, not float like 172800.0)
     local ttl = math.max(ttl_sec, 1)
-    return ttl - ttl % 1  -- ensure integer by truncating any fractional part
+    return math.floor(ttl)  -- ensure integer return value
 end
 
 if dedup ~= '' then
