@@ -197,12 +197,12 @@ pub fn isKnownDivergence(case_name: []const u8, backend: Backend) ?[]const u8 {
 // ---- backend opening ----
 
 fn openPostgres(alloc: std.mem.Allocator, dsn: []const u8) !broker.Broker {
-    const p = try PgBroker.open(alloc, dsn);
+    const p = try PgBroker.open(alloc, dsn, 5 * 60 * 1000);
     return PgBroker.toBroker(p);
 }
 
 fn openRedis(alloc: std.mem.Allocator, url: []const u8) !broker.Broker {
-    const r = try RedisBroker.open(alloc, url);
+    const r = try RedisBroker.open(alloc, url, 5 * 60 * 1000);
     return RedisBroker.toBroker(r);
 }
 
