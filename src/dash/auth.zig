@@ -225,7 +225,7 @@ pub const Auth = struct {
     }
 
     /// Maximum number of concurrent login attempts tracked before eviction.
-const max_attempts: usize = 100;
+    const max_attempts: usize = 100;
 
     /// Attempt login. Returns the session token on success, or an error.
     /// Rate limited: after 5 consecutive failures the account is locked for
