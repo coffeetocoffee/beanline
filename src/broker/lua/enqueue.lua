@@ -28,9 +28,9 @@ local function compute_ttl(run_at_ms, now_ms, grace_sec)
         -- Job is due or past due; use grace from enqueue time.
         ttl_sec = grace_sec
     end
-    -- Ensure integer TTL (Redis EX requires integer, not float like 172800.0)
+    -- Ensure integer TTL string (Redis EX requires integer, not float like 172800.0)
     local ttl = math.max(ttl_sec, 1)
-    return math.floor(ttl)  -- ensure integer return value
+    return string.format("%d", math.floor(ttl))
 end
 
 if dedup ~= '' then
