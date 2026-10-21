@@ -20,12 +20,15 @@ pub const Config = struct {
     drain_timeout_ms: u64 = 30_000,
     retention_completed_ms: i64 = 72 * 60 * 60 * 1000,
     retention_events_ms: i64 = 7 * 24 * 60 * 60 * 1000,
+    aging_interval_ms: u64 = 5 * 60 * 1000,
     dashboard_bind: []const u8 = "127.0.0.1:9484",
     dashboard_enabled: bool = false,
     dashboard_auth_secret: []const u8 = "",
     dashboard_readonly: bool = false,
     dashboard_users: []const []const u8 = &.{},
     dashboard_keys: []const []const u8 = &.{},
+    dashboard_tls: bool = false,
+    dashboard_secure_cookie: ?bool = null,
     /// OIDC provider for dashboard SSO. Enabled when authorize, token, and
     /// client id are all set (BEANLINE_DASH_OIDC_*).
     oidc: auth_mod.Oidc = .{},
@@ -137,6 +140,7 @@ pub fn load() Config {
     c.drain_timeout_ms = envNum(u64, "BEANLINE_DRAIN_TIMEOUT_MS", 30_000) catch 30_000;
     c.retention_completed_ms = envNum(i64, "BEANLINE_RETENTION_COMPLETED_MS", 72 * 60 * 60 * 1000) catch 72 * 60 * 60 * 1000;
     c.retention_events_ms = envNum(i64, "BEANLINE_RETENTION_EVENTS_MS", 7 * 24 * 60 * 60 * 1000) catch 7 * 24 * 60 * 60 * 1000;
+    c.aging_interval_ms = envNum(u64, "BEANLINE_AGING_INTERVAL_MS", 5 * 60 * 1000) catch 5 * 60 * 1000;
 
     const bind = std.process.getEnvVarOwned(std.heap.page_allocator, "BEANLINE_DASH_BIND") catch null;
     if (bind) |b| c.dashboard_bind = b;
@@ -150,6 +154,12 @@ pub fn load() Config {
     c.dashboard_keys = splitList(std.heap.page_allocator, keys) catch &.{};
     const otel = std.process.getEnvVarOwned(std.heap.page_allocator, "BEANLINE_OTEL_ENDPOINT") catch null;
     if (otel) |o| c.otel_endpoint = o;
+
+    const tls = std.process.getEnvVarOwned(std.heap.page_allocator, "BEANLINE_DASH_TLS") catch null;
+    if (tls != null) c.dashboard_tls = envBool("BEANLINE_DASH_TLS", false);
+
+    const sc = std.process.getEnvVarOwned(std.heap.page_allocator, "BEANLINE_DASH_SECURE_COOKIE") catch null;
+    if (sc) |s| c.dashboard_secure_cookie = if (std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "yes")) true else false;
 
     // OIDC SSO. Endpoints are explicit; there is no .well-known discovery.
     c.oidc = .{

@@ -143,7 +143,7 @@ test "oidc: unconfigured is 404, configured redirects with state and pkce" {
     var log = logs_mod.Logger.init(std.io.getStdErr());
 
     const port: u16 = 19485;
-    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19485", false);
+    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19485", false, true);
     try srv.start();
     defer srv.stopServer();
     std.time.sleep(150 * std.time.ns_per_ms);
@@ -223,7 +223,7 @@ test "live http smoke: healthz, api, auth gate, metrics" {
     var log = logs_mod.Logger.init(std.io.getStdErr());
 
     const port: u16 = 19484;
-    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19484", false);
+    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19484", false, true);
     try srv.start();
     defer srv.stopServer();
     std.time.sleep(150 * std.time.ns_per_ms);
@@ -311,7 +311,7 @@ test "api authorization matrix: scopes gate reads, writes, and the event stream"
     var log = logs_mod.Logger.init(std.io.getStdErr());
 
     const port: u16 = 19486;
-    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19486", false);
+    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19486", false, true);
     try srv.start();
     defer srv.stopServer();
     std.time.sleep(150 * std.time.ns_per_ms);
@@ -403,7 +403,7 @@ test "readonly mode blocks api key mutations" {
     var log = logs_mod.Logger.init(std.io.getStdErr());
 
     const port: u16 = 19487;
-    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19487", true);
+    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19487", true, true);
     try srv.start();
     defer srv.stopServer();
     std.time.sleep(150 * std.time.ns_per_ms);
@@ -437,7 +437,7 @@ test "queue pause and resume: control scope, method, and reflected state" {
     var log = logs_mod.Logger.init(std.io.getStdErr());
 
     const port: u16 = 19488;
-    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19488", false);
+    var srv = server_mod.Server.init(alloc, br, &auth, &bus, &metrics, &log, &.{"default"}, "127.0.0.1:19488", false, true);
     try srv.start();
     defer srv.stopServer();
     std.time.sleep(150 * std.time.ns_per_ms);

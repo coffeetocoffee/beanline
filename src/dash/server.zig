@@ -24,6 +24,7 @@ pub const Server = struct {
     queue_names: []const []const u8,
     bind: []const u8,
     readonly: bool,
+    secure_cookies: bool,
     net_server: ?std.net.Server = null,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
@@ -47,6 +48,7 @@ pub const Server = struct {
         queue_names: []const []const u8,
         bind: []const u8,
         readonly: bool,
+        secure_cookies: bool,
     ) Server {
         return .{
             .alloc = alloc,
@@ -59,6 +61,7 @@ pub const Server = struct {
             .queue_names = queue_names,
             .bind = bind,
             .readonly = readonly,
+            .secure_cookies = secure_cookies,
         };
     }
 
@@ -384,11 +387,17 @@ pub const Server = struct {
                 var tok: [32]u8 = undefined;
                 if (parseHexToken(c, &tok)) self.auth.logout(&tok);
             }
+            const secure_attr = if (self.secure_cookies) " Secure; " else "";
+            var logout_cookie_buf: [128]u8 = undefined;
+            const logout_cookie = std.fmt.bufPrint(&logout_cookie_buf, "beanline_session=; Path=/; HttpOnly;{s}SameSite=Strict; Max-Age=0", .{secure_attr}) catch {
+                try self.respondStatus(req, .internal_server_error, "cookie");
+                return;
+            };
             try req.respond("{\"ok\":true}", .{
                 .status = .ok,
                 .extra_headers = &.{
                     .{ .name = "content-type", .value = "application/json" },
-                    .{ .name = "set-cookie", .value = "beanline_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" },
+                    .{ .name = "set-cookie", .value = logout_cookie },
                 },
             });
             return;
@@ -451,13 +460,14 @@ pub const Server = struct {
         const hs = hexToken(tok, &hex);
         var csrf_hex: [64]u8 = undefined;
         const cs = hexToken(csrf, &csrf_hex);
+        const secure_attr = if (self.secure_cookies) " Secure; " else "";
         var cookie_buf: [256]u8 = undefined;
-        const cookie = std.fmt.bufPrint(&cookie_buf, "beanline_session={s}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400", .{hs}) catch {
+        const cookie = std.fmt.bufPrint(&cookie_buf, "beanline_session={s}; Path=/; HttpOnly;{s}SameSite=Strict; Max-Age=86400", .{hs, secure_attr}) catch {
             try self.respondStatus(req, .internal_server_error, "cookie");
             return;
         };
         var csrf_buf: [128]u8 = undefined;
-        const csrf_cookie = std.fmt.bufPrint(&csrf_buf, "beanline_csrf={s}; Path=/; SameSite=Strict; Max-Age=86400", .{cs}) catch {
+        const csrf_cookie = std.fmt.bufPrint(&csrf_buf, "beanline_csrf={s}; Path=/;{s}SameSite=Strict; Max-Age=86400", .{cs, secure_attr}) catch {
             try self.respondStatus(req, .internal_server_error, "cookie");
             return;
         };
@@ -570,13 +580,14 @@ pub const Server = struct {
         const hs = hexToken(tok, &hex);
         var csrf_hex: [64]u8 = undefined;
         const cs = hexToken(csrf, &csrf_hex);
+        const secure_attr = if (self.secure_cookies) " Secure; " else "";
         var cookie_buf: [256]u8 = undefined;
-        const cookie = std.fmt.bufPrint(&cookie_buf, "beanline_session={s}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400", .{hs}) catch {
+        const cookie = std.fmt.bufPrint(&cookie_buf, "beanline_session={s}; Path=/; HttpOnly;{s}SameSite=Strict; Max-Age=86400", .{hs, secure_attr}) catch {
             try self.respondStatus(req, .internal_server_error, "cookie");
             return;
         };
         var csrf_buf: [128]u8 = undefined;
-        const csrf_cookie = std.fmt.bufPrint(&csrf_buf, "beanline_csrf={s}; Path=/; SameSite=Strict; Max-Age=86400", .{cs}) catch {
+        const csrf_cookie = std.fmt.bufPrint(&csrf_buf, "beanline_csrf={s}; Path=/;{s}SameSite=Strict; Max-Age=86400", .{cs, secure_attr}) catch {
             try self.respondStatus(req, .internal_server_error, "cookie");
             return;
         };

@@ -98,7 +98,7 @@ test "e2e worker owner over postgres" {
     const dsn = std.process.getEnvVarOwned(alloc, "BEANLINE_TEST_DSN") catch return;
     defer alloc.free(dsn);
 
-    const p = try pg.open(alloc, dsn);
+    const p = try pg.open(alloc, dsn, 5 * 60 * 1000);
     const br = pg.toBroker(p);
     defer br.deinit();
 
@@ -112,7 +112,7 @@ test "e2e worker owner over redis" {
     const url = std.process.getEnvVarOwned(alloc, "BEANLINE_TEST_REDIS_URL") catch return;
     defer alloc.free(url);
 
-    const r = try redis.open(alloc, url);
+    const r = try redis.open(alloc, url, 5 * 60 * 1000);
     const br = redis.toBroker(r);
     defer br.deinit();
 

@@ -72,6 +72,7 @@ const Redis = struct {
     c: client.Client,
     claim_arena: std.heap.ArenaAllocator,
     read_arena: std.heap.ArenaAllocator,
+    aging_interval_ms: u64,
     /// Serializes all connection use. RESP is strictly request/response on
     /// one stream, so concurrent use from multiple threads interleaves
     /// commands and corrupts reply parsing. Lock at the vtable entry points
@@ -127,6 +128,7 @@ const Redis = struct {
             try std.fmt.allocPrint(al, "{d}", .{now}),
             try std.fmt.allocPrint(al, "{d}", .{lease_ms}),
             try std.fmt.allocPrint(al, "{d}", .{bounded}),
+            try std.fmt.allocPrint(al, "{d}", .{self.aging_interval_ms}),
         };
         const v = try self.c.eval(al, claim_lua, &.{}, &argv);
         const items = switch (v) {
@@ -769,7 +771,7 @@ pub const vtable = b.VTable{
     .queue_paused = queuePausedCb,
 };
 
-pub fn open(alloc: std.mem.Allocator, url_str: []const u8) !*Redis {
+pub fn open(alloc: std.mem.Allocator, url_str: []const u8, aging_interval_ms: u64) !*Redis {
     const u = try Url.parse(alloc, url_str);
     defer u.free(alloc);
 
@@ -780,6 +782,7 @@ pub fn open(alloc: std.mem.Allocator, url_str: []const u8) !*Redis {
         .c = try client.Client.connect(alloc, u.host, u.port, u.password),
         .claim_arena = std.heap.ArenaAllocator.init(alloc),
         .read_arena = std.heap.ArenaAllocator.init(alloc),
+        .aging_interval_ms = aging_interval_ms,
     };
     errdefer self.c.deinit();
 
@@ -844,7 +847,7 @@ test "live redis round trip" {
     const url = std.process.getEnvVarOwned(alloc, "BEANLINE_TEST_REDIS_URL") catch return;
     defer alloc.free(url);
 
-    const r = try open(alloc, url);
+    const r = try open(alloc, url, 5 * 60 * 1000);
     const br = toBroker(r);
     defer br.deinit();
 

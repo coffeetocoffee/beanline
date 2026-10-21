@@ -329,7 +329,7 @@ test "live scheduler enqueues exactly one job per slot with pg dedup" {
     defer alloc.free(dsn);
 
     const pg = @import("../broker/postgres.zig");
-    const p = try pg.open(alloc, dsn);
+    const p = try pg.open(alloc, dsn, 5 * 60 * 1000);
     const br = pg.toBroker(p);
     defer br.deinit();
 

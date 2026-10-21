@@ -204,7 +204,7 @@ test "live leader lease on postgres" {
     const dsn = std.process.getEnvVarOwned(alloc, "BEANLINE_TEST_DSN") catch return;
     defer alloc.free(dsn);
     const postgres = @import("../broker/postgres.zig");
-    const p = postgres.open(alloc, dsn) catch return;
+    const p = postgres.open(alloc, dsn, 5 * 60 * 1000) catch return;
     defer alloc.destroy(p);
     defer p.c.deinit();
     try p.c.execSimple("DELETE FROM beanline_leaders WHERE role = 'beanline-test-role'");
@@ -219,7 +219,7 @@ test "live leader lease on redis" {
     const url = std.process.getEnvVarOwned(alloc, "BEANLINE_TEST_REDIS_URL") catch return;
     defer alloc.free(url);
     const redis = @import("../broker/redis.zig");
-    const r = redis.open(alloc, url) catch return;
+    const r = redis.open(alloc, url, 5 * 60 * 1000) catch return;
     defer alloc.destroy(r);
     defer r.c.deinit();
     {

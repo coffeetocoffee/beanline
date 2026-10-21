@@ -50,7 +50,7 @@ const SQL_CLAIM =
     \\  SELECT id FROM beanline_jobs
     \\  WHERE queue = $1 AND status = 'available' AND run_at <= now()
     \\    AND NOT EXISTS (SELECT 1 FROM beanline_queue_state s WHERE s.queue = $1 AND s.paused)
-    \\  ORDER BY priority, run_at
+    \\  ORDER BY (priority::int - floor((extract(epoch from now()) * 1000 - (extract(epoch from inserted_at) * 1000)::bigint)::numeric / $5::numeric))::int, run_at
     \\  FOR UPDATE SKIP LOCKED
     \\  LIMIT $2
     \\)
@@ -146,6 +146,7 @@ const Pg = struct {
     c: pg.Conn,
     claim: ?pg.Rows = null,
     read_arena: std.heap.ArenaAllocator,
+    aging_interval_ms: u64,
     /// Serializes all connection use. The Postgres wire protocol is strictly
     /// request/response on one stream, and several operations pair BEGIN with
     /// COMMIT, so concurrent use from multiple threads corrupts the frame
@@ -188,10 +189,11 @@ const Pg = struct {
         if (out.len == 0) return 0;
         const bounded: u32 = @intCast(@min(limit, out.len));
 
-        var pbuf: [2][24]u8 = undefined;
+        var pbuf: [3][24]u8 = undefined;
         const lim = try std.fmt.bufPrint(&pbuf[0], "{d}", .{bounded});
         const lms = try std.fmt.bufPrint(&pbuf[1], "{d}", .{lease_ms});
-        const params = [_]?[]const u8{ queue, lim, worker_id, lms };
+        const aging = try std.fmt.bufPrint(&pbuf[2], "{d}", .{self.aging_interval_ms});
+        const params = [_]?[]const u8{ queue, lim, worker_id, lms, aging };
 
         try self.c.execSimple("BEGIN");
         errdefer self.rollback();
@@ -885,12 +887,12 @@ pub const vtable = b.VTable{
     .queue_paused = queuePausedCb,
 };
 
-pub fn open(alloc: std.mem.Allocator, dsn: []const u8) !*Pg {
+pub fn open(alloc: std.mem.Allocator, dsn: []const u8, aging_interval_ms: u64) !*Pg {
     const cfg = try pg.parseDsn(alloc, dsn);
     defer cfg.free(alloc);
     const self = try alloc.create(Pg);
     errdefer alloc.destroy(self);
-    self.* = .{ .alloc = alloc, .c = try pg.Conn.connect(alloc, cfg), .read_arena = std.heap.ArenaAllocator.init(alloc) };
+    self.* = .{ .alloc = alloc, .c = try pg.Conn.connect(alloc, cfg), .read_arena = std.heap.ArenaAllocator.init(alloc), .aging_interval_ms = aging_interval_ms };
     return self;
 }
 
@@ -921,7 +923,7 @@ test "id and epoch arrays build postgres literals" {
 }
 
 test "json quoting escapes" {
-    var p = Pg{ .alloc = std.testing.allocator, .c = undefined, .read_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    var p = Pg{ .alloc = std.testing.allocator, .c = undefined, .read_arena = std.heap.ArenaAllocator.init(std.testing.allocator), .aging_interval_ms = 5 * 60 * 1000 };
     const q = try p.quoteJson("a\"b\\c");
     defer p.alloc.free(q);
     try std.testing.expectEqualStrings("\"a\\\"b\\\\c\"", q);
@@ -935,7 +937,7 @@ test "live broker round trip" {
     const dsn = std.process.getEnvVarOwned(alloc, "BEANLINE_TEST_DSN") catch return;
     defer alloc.free(dsn);
 
-    const p = try open(alloc, dsn);
+    const p = try open(alloc, dsn, 5 * 60 * 1000);
     const br = toBroker(p);
     defer br.deinit();
     defer p.c.execSimple("DELETE FROM beanline_jobs WHERE queue = 'live-test'") catch {};

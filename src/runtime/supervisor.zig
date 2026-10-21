@@ -45,6 +45,17 @@ fn installSignals() void {
     }
 }
 
+fn isLoopback(bind: []const u8) bool {
+    const colon = std.mem.lastIndexOfScalar(u8, bind, ':') orelse return false;
+    const host = bind[0..colon];
+    return std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "::1") or std.mem.eql(u8, host, "localhost");
+}
+
+fn computeSecureCookies(cfg: config_mod.Config) bool {
+    if (cfg.dashboard_secure_cookie) |explicit| return explicit;
+    return cfg.dashboard_tls or isLoopback(cfg.dashboard_bind);
+}
+
 pub const App = struct {
     alloc: std.mem.Allocator,
     reg: registry.Registry,
@@ -118,21 +129,21 @@ pub const App = struct {
     fn openBroker(self: *App) !broker_mod.Broker {
         if (try self.envOpt("BEANLINE_DATABASE_URL")) |dsn| {
             defer self.alloc.free(dsn);
-            const p = try postgres.open(self.alloc, dsn);
+            const p = try postgres.open(self.alloc, dsn, self.cfg.aging_interval_ms);
             return postgres.toBroker(p);
         }
         if (try self.envOpt("BEANLINE_REDIS_URL")) |url| {
             defer self.alloc.free(url);
-            const r = try redis.open(self.alloc, url);
+            const r = try redis.open(self.alloc, url, self.cfg.aging_interval_ms);
             return redis.toBroker(r);
         }
         // fall back to the loaded config
         if (self.cfg.dsn.len > 0) {
-            const p = try postgres.open(self.alloc, self.cfg.dsn);
+            const p = try postgres.open(self.alloc, self.cfg.dsn, self.cfg.aging_interval_ms);
             return postgres.toBroker(p);
         }
         if (self.cfg.redis_url.len > 0) {
-            const r = try redis.open(self.alloc, self.cfg.redis_url);
+            const r = try redis.open(self.alloc, self.cfg.redis_url, self.cfg.aging_interval_ms);
             return redis.toBroker(r);
         }
         return error.NoBackendConfigured;
@@ -195,6 +206,7 @@ pub const App = struct {
                 self.queue_names.items,
                 self.cfg.dashboard_bind,
                 self.cfg.dashboard_readonly,
+                computeSecureCookies(self.cfg),
             );
             srv.start() catch |e| {
                 self.log.err("dashboard: failed to start ({s})", .{@errorName(e)});
@@ -283,6 +295,7 @@ pub const App = struct {
             self.queue_names.items,
             self.cfg.dashboard_bind,
             self.cfg.dashboard_readonly,
+            computeSecureCookies(self.cfg),
         );
         srv.start() catch |e| {
             self.log.err("server: failed to start ({s})", .{@errorName(e)});
