@@ -56,3 +56,12 @@ Lessons that cost the most time:
   dash server logs to stderr from its thread. Pre-existing, exit code 0.
 - `src/dash/server.zig` uses a 100ms `poll` accept loop (not a self-connect
   wakeup). More deterministic; not the cause of any hang.
+
+## Permanent CI Requirements (ALWAYS REMEMBER)
+
+1. **Contract suite must build and test on all three OSes** (macOS, Ubuntu, Windows) with both Postgres and Redis backends.
+   - The GitHub Actions `contract` job runs on `ubuntu-latest` with postgres:16-alpine and redis:7-alpine services.
+   - Contract tests require `BEANLINE_TEST_DSN` and `BEANLINE_TEST_REDIS_URL` env vars + `BEANLINE_CONTRACT_REQUIRED=1`.
+   - Build step: `zig build test-contract-install` then run `./zig-out/bin/test-contract` directly (NOT via `zig build test-contract`).
+
+2. **Always run `zig fmt --check src tests build.zig` before committing** — the CI fmt check step runs this on all three OSes and will fail the build if formatting is off. `src/dash/server.zig` has had formatting issues before; run `zig fmt src/dash/server.zig` to fix.

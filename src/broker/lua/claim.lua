@@ -1,14 +1,16 @@
 local q = ARGV[1]
 local worker = ARGV[2]
-local now = tonumber(ARGV[3])
-local lease = tonumber(ARGV[4])
-local n = tonumber(ARGV[5])
-local aging_interval = tonumber(ARGV[6])
+-- Get time from Redis server to avoid clock skew between workers
+local time_obj = redis.call('TIME')
+local now_ms = tonumber(time_obj[1]) * 1000 + math.floor(tonumber(time_obj[2]) / 1000)
+local lease = tonumber(ARGV[3])
+local n = tonumber(ARGV[4])
+local aging_interval = tonumber(ARGV[5])
 local prefix = 'beanline:{' .. q .. '}'
 if redis.call('EXISTS', prefix .. ':paused') == 1 then
   return {}
 end
-local delayed = redis.call('ZRANGEBYSCORE', prefix .. ':delayed', '-inf', now, 'LIMIT', 0, n)
+local delayed = redis.call('ZRANGEBYSCORE', prefix .. ':delayed', '-inf', now_ms, 'LIMIT', 0, n)
 for _, id in ipairs(delayed) do
   local jk = prefix .. ':job:' .. id
   local st = redis.call('HGET', jk, 'status')
@@ -35,7 +37,7 @@ for prio = 0, 3 do
     local jk = prefix .. ':job:' .. id
     if redis.call('HGET', jk, 'status') == 'available' then
       local inserted_at = tonumber(redis.call('HGET', jk, 'inserted_at'))
-      local wait_ms = now - inserted_at
+      local wait_ms = now_ms - inserted_at
       local age_credit = 0
       if aging_interval > 0 and wait_ms > 0 then
         age_credit = math.floor(wait_ms / aging_interval)
@@ -60,8 +62,10 @@ if best_job then
     local epoch = redis.call('HINCRBY', jk, 'epoch', 1)
     local attempts = redis.call('HINCRBY', jk, 'attempts', 1)
     redis.call('HSET', jk, 'status', 'running', 'worker', worker)
+    -- Set lease using Redis server time
+    local lease_end_ms = now_ms + lease
     redis.call('SET', prefix .. ':lease:' .. id, worker, 'PX', lease)
-    redis.call('ZADD', prefix .. ':expires', now + lease, id)
+    redis.call('ZADD', prefix .. ':expires', lease_end_ms, id)
     redis.call('HINCRBY', prefix .. ':depth', 'available', -1)
     redis.call('HINCRBY', prefix .. ':depth', 'running', 1)
     redis.call('RPUSH', prefix .. ':events:' .. id, cjson.encode({ type = 'claimed', epoch = epoch, worker = worker }))
@@ -91,7 +95,7 @@ while #taken < n do
       local jk = prefix .. ':job:' .. id
       if redis.call('HGET', jk, 'status') == 'available' then
         local inserted_at = tonumber(redis.call('HGET', jk, 'inserted_at'))
-        local wait_ms = now - inserted_at
+        local wait_ms = now_ms - inserted_at
         local age_credit = 0
         if aging_interval > 0 and wait_ms > 0 then
           age_credit = math.floor(wait_ms / aging_interval)
@@ -114,8 +118,10 @@ while #taken < n do
     local epoch = redis.call('HINCRBY', jk, 'epoch', 1)
     local attempts = redis.call('HINCRBY', jk, 'attempts', 1)
     redis.call('HSET', jk, 'status', 'running', 'worker', worker)
+    -- Set lease using Redis server time
+    local lease_end_ms = now_ms + lease
     redis.call('SET', prefix .. ':lease:' .. id, worker, 'PX', lease)
-    redis.call('ZADD', prefix .. ':expires', now + lease, id)
+    redis.call('ZADD', prefix .. ':expires', lease_end_ms, id)
     redis.call('HINCRBY', prefix .. ':depth', 'available', -1)
     redis.call('HINCRBY', prefix .. ':depth', 'running', 1)
     redis.call('RPUSH', prefix .. ':events:' .. id, cjson.encode({ type = 'claimed', epoch = epoch, worker = worker }))

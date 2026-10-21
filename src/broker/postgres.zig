@@ -9,7 +9,7 @@ const SQL_INSERT_UNIQUE =
     \\  $6::int, $7, $8, $9::jsonb,
     \\  CASE WHEN $5::bigint <> 0 AND to_timestamp($5::bigint::double precision / 1000.0) > now()
     \\       THEN 'scheduled' ELSE 'available' END)
-    \\ON CONFLICT (queue, kind, unique_key) WHERE unique_key IS NOT NULL AND status NOT IN ('completed','discarded','cancelled')
+    \\ON CONFLICT (queue, kind, unique_key) WHERE unique_key IS NOT NULL AND status NOT IN ('completed','discarded','cancelled','dead')
     \\DO NOTHING
     \\RETURNING id
 ;
@@ -29,14 +29,14 @@ const SQL_INSERT_DEDUP =
 const SQL_LOOKUP_UNIQUE =
     \\SELECT id FROM beanline_jobs
     \\WHERE queue = $1 AND kind = $2 AND unique_key = $3
-    \\  AND status NOT IN ('completed','discarded','cancelled')
+    \\  AND status NOT IN ('completed','discarded','cancelled','dead')
     \\LIMIT 1
 ;
 
 const SQL_LOOKUP_DEDUP =
     \\SELECT id FROM beanline_jobs
     \\WHERE kind = $1 AND dedup_run_id = $2
-    \\  AND status NOT IN ('completed','discarded','cancelled')
+    \\  AND status NOT IN ('completed','discarded','cancelled','dead')
     \\LIMIT 1
 ;
 

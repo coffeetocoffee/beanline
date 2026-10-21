@@ -598,9 +598,10 @@ fn probe_unique_released_after_dead(f: *Fixture) !void {
     const c = try f.claim(1);
     _ = try f.fail(enq.id, c[0].lease_epoch, "E", false, 0);
     const e2 = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .unique_key = "ud-1" });
-    // postgres: deduped (key still held); redis: not deduped (guard released)
+    // After fix: both postgres and redis release the guard when job goes dead,
+    // so re-enqueue should be deduped (not deduped = job was accepted)
     if (f.backend == .postgres) {
-        try std.testing.expect(e2.deduped);
+        try std.testing.expect(!e2.deduped);
     } else {
         try std.testing.expect(!e2.deduped);
     }

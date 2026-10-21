@@ -7,10 +7,12 @@ local maxa = ARGV[6]
 local uniq = ARGV[7]
 local dedup = ARGV[8]
 local ctx = ARGV[9]
-local now = tonumber(ARGV[10])
+-- Get time from Redis server to avoid clock skew between workers
+local time_obj = redis.call('TIME')
+local now_ms = tonumber(time_obj[1]) * 1000 + math.floor(tonumber(time_obj[2]) / 1000)
 local prefix = 'beanline:{' .. q .. '}'
 local status = 'available'
-if run_at > now then status = 'scheduled' end
+if run_at > now_ms then status = 'scheduled' end
 local id = redis.call('INCR', 'beanline:seq')
 local jk = prefix .. ':job:' .. id
 if dedup ~= '' then
@@ -32,7 +34,7 @@ redis.call('HSET', jk,
   'queue', q, 'kind', kind, 'args', args, 'priority', prio,
   'status', status, 'attempts', '0', 'max_attempts', maxa, 'epoch', '0',
   'unique', uniq, 'dedup', dedup, 'run_at', tostring(run_at),
-  'context', ctx, 'inserted_at', tostring(now))
+  'context', ctx, 'inserted_at', tostring(now_ms))
 if status == 'available' then
   redis.call('LPUSH', prefix .. ':ready:' .. prio, id)
 else

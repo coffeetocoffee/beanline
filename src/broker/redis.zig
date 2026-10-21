@@ -85,7 +85,6 @@ const Redis = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const al = arena.allocator();
-        const now: i64 = std.time.milliTimestamp();
         const argv = [_][]const u8{
             opts.queue,
             kind,
@@ -96,7 +95,6 @@ const Redis = struct {
             opts.unique_key orelse "",
             opts.dedup_run_id orelse "",
             opts.context_json,
-            try std.fmt.allocPrint(al, "{d}", .{now}),
         };
         const v = try self.c.eval(al, enqueue_lua, &.{}, &argv);
         const items = switch (v) {
@@ -121,11 +119,9 @@ const Redis = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const al = arena.allocator();
-        const now: i64 = std.time.milliTimestamp();
         const argv = [_][]const u8{
             queue,
             worker_id,
-            try std.fmt.allocPrint(al, "{d}", .{now}),
             try std.fmt.allocPrint(al, "{d}", .{lease_ms}),
             try std.fmt.allocPrint(al, "{d}", .{bounded}),
             try std.fmt.allocPrint(al, "{d}", .{self.aging_interval_ms}),
@@ -265,10 +261,8 @@ const Redis = struct {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
             const al = arena.allocator();
-            const now: i64 = std.time.milliTimestamp();
             const argv = [_][]const u8{
                 queue,
-                try std.fmt.allocPrint(al, "{d}", .{now}),
                 try std.fmt.allocPrint(al, "{d}", .{limit}),
             };
             const v = try self.c.eval(al, reap_lua, &.{}, &argv);
