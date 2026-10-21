@@ -22,7 +22,7 @@ local function compute_ttl(run_at_ms, now_ms, grace_sec)
     local diff_ms = run_at_ms - now_ms
     if diff_ms > 0 then
         -- TTL = (run_at - now) + grace, in seconds; ensure at least 1s.
-        return math.max(diff_ms / 1000 + grace_sec, 1)
+        return math.max(math.floor(diff_ms / 1000) + grace_sec, 1)
     else
         -- Job is due or past due; use grace from enqueue time.
         return math.max(grace_sec, 1)
