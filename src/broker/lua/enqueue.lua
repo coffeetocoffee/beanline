@@ -20,13 +20,16 @@ local jk = prefix .. ':job:' .. id
 -- Grace periods ensure the guard outlasts the job's execution.
 local function compute_ttl(run_at_ms, now_ms, grace_sec)
     local diff_ms = run_at_ms - now_ms
+    local ttl_sec
     if diff_ms > 0 then
         -- TTL = (run_at - now) + grace, in seconds; ensure at least 1s.
-        return math.max(math.floor(diff_ms / 1000) + grace_sec, 1)
+        ttl_sec = math.floor(diff_ms / 1000) + grace_sec
     else
         -- Job is due or past due; use grace from enqueue time.
-        return math.max(grace_sec, 1)
+        ttl_sec = grace_sec
     end
+    -- Ensure integer TTL (Redis EX requires integer, not float like 172800.0)
+    return math.max(ttl_sec, 1)
 end
 
 if dedup ~= '' then
