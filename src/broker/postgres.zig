@@ -33,10 +33,14 @@ const SQL_LOOKUP_UNIQUE =
     \\LIMIT 1
 ;
 
+// The dedup index has no status predicate, so a dead row still holds its
+// dedup_run_id key (Redis holds it too, until the 2 day TTL expires). The
+// lookup must agree with the index: excluding 'dead' here would return no id
+// for a conflict that the index did reject.
 const SQL_LOOKUP_DEDUP =
     \\SELECT id FROM beanline_jobs
     \\WHERE kind = $1 AND dedup_run_id = $2
-    \\  AND status NOT IN ('completed','discarded','cancelled','dead')
+    \\  AND status NOT IN ('completed','discarded','cancelled')
     \\LIMIT 1
 ;
 
@@ -530,10 +534,23 @@ const SQL_RESUME_QUEUE =
 
 const SQL_QUEUE_PAUSED = "SELECT paused FROM beanline_queue_state WHERE queue = $1";
 
+// Operator retry brings a terminal job back to 'available', which puts its
+// row back into the partial unique index. If another job already holds the
+// same unique key (the key is released when a job dies, so a later enqueue
+// can take it), the update would violate the index. In that case the retried
+// job gives up the key instead of failing the operator request: Redis behaves
+// the same way, since a retried job does not re-acquire the guard.
 const SQL_RETRY =
-    \\UPDATE beanline_jobs SET status = 'available', run_at = now(),
-    \\  attempts = 0, lock_expires_at = NULL
-    \\WHERE id = $1 AND queue = $2 AND status IN ('dead','discarded','cancelled')
+    \\UPDATE beanline_jobs j SET status = 'available', run_at = now(),
+    \\  attempts = 0, lock_expires_at = NULL,
+    \\  unique_key = CASE WHEN EXISTS (
+    \\      SELECT 1 FROM beanline_jobs o
+    \\      WHERE o.queue = j.queue AND o.kind = j.kind
+    \\        AND o.unique_key = j.unique_key AND o.unique_key IS NOT NULL
+    \\        AND o.id <> j.id
+    \\        AND o.status NOT IN ('completed','discarded','cancelled','dead'))
+    \\    THEN NULL ELSE j.unique_key END
+    \\WHERE j.id = $1 AND j.queue = $2 AND j.status IN ('dead','discarded','cancelled')
 ;
 
 const SQL_DISCARD =
