@@ -310,6 +310,12 @@ pub const Auth = struct {
 
     /// Look up an API key by Authorization header. Format:
     /// "Bearer <prefix>.<secret>".
+    fn constantTimeEql(a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        var acc: u8 = 0;
+        for (a, 0..) |x, i| acc |= x ^ b[i];
+        return acc == 0;
+    }
     fn findKey(self: *Auth, header: []const u8) ?*const ApiKey {
         if (!std.mem.startsWith(u8, header, "Bearer ")) return null;
         const rest = header["Bearer ".len..];
@@ -317,7 +323,9 @@ pub const Auth = struct {
         const prefix = rest[0..dot];
         const secret = rest[dot + 1 ..];
         for (self.keys.items) |*k| {
-            if (std.mem.eql(u8, k.prefix, prefix) and std.mem.eql(u8, k.key, secret)) return k;
+            if (!std.mem.eql(u8, k.prefix, prefix)) continue;
+            if (k.key.len != secret.len) continue;
+            if (constantTimeEql(k.key, secret)) return k;
         }
         return null;
     }

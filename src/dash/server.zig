@@ -29,6 +29,8 @@ pub const Server = struct {
     thread: ?std.Thread = null,
     broken_broker: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     broken_since_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    max_conns: u32 = 256,
+    active_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub const Role = struct {
         auth: *auth_mod.Auth,
@@ -132,11 +134,48 @@ pub const Server = struct {
                 conn.stream.close();
                 return;
             }
-            self.handleConn(conn) catch {};
+            if (self.active_conns.load(.seq_cst) >= self.max_conns) {
+                conn.stream.close();
+                continue;
+            }
+            _ = self.active_conns.fetchAdd(1, .seq_cst);
+            const th = std.Thread.spawn(.{}, handleConnThread, .{ self, conn }) catch {
+                _ = self.active_conns.fetchSub(1, .seq_cst);
+                conn.stream.close();
+                continue;
+            };
+            th.detach();
         }
     }
 
+    fn handleConnThread(self: *Server, conn: std.net.Server.Connection) void {
+        defer _ = self.active_conns.fetchSub(1, .seq_cst);
+        self.handleConn(conn) catch {};
+    }
+
+    fn setTimeouts(fd: std.posix.socket_t) void {
+        const tv = std.posix.timeval{ .sec = 30, .usec = 0 };
+        const bytes = std.mem.asBytes(&tv);
+        const level: i32 = switch (@import("builtin").os.tag) {
+            .windows => 0xffff,
+            else => 1,
+        };
+        const rcv: u32 = switch (@import("builtin").os.tag) {
+            .windows => 0x1006,
+            .macos, .ios, .tvos, .watchos => 0x1006,
+            else => 20,
+        };
+        const snd: u32 = switch (@import("builtin").os.tag) {
+            .windows => 0x1005,
+            .macos, .ios, .tvos, .watchos => 0x1005,
+            else => 21,
+        };
+        std.posix.setsockopt(fd, level, rcv, bytes) catch {};
+        std.posix.setsockopt(fd, level, snd, bytes) catch {};
+    }
+
     fn handleConn(self: *Server, conn: std.net.Server.Connection) !void {
+        setTimeouts(conn.stream.handle);
         defer conn.stream.close();
         // A keep-alive client that has finished its request stays connected
         // waiting for another head; without a stop check the accept thread
