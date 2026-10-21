@@ -363,6 +363,17 @@ pub const Server = struct {
             return;
         }
         if (std.mem.eql(u8, path, "/metrics")) {
+            if (!self.openReads()) {
+                const actor = self.authenticate(req);
+                if (!self.authorized(actor, .read)) {
+                    if (actor.isAuthed()) {
+                        try self.jsonResponse(req, .forbidden, "{\"error\":\"forbidden\"}", &.{});
+                    } else {
+                        try self.jsonResponse(req, .unauthorized, "{\"error\":\"unauthorized\"}", &.{});
+                    }
+                    return;
+                }
+            }
             const body = self.metrics.render(self.alloc) catch {
                 try self.respondStatus(req, .internal_server_error, "render_failed");
                 return;

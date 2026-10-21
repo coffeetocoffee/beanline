@@ -215,6 +215,7 @@ test "live http smoke: healthz, api, auth gate, metrics" {
     var auth = auth_mod.Auth.init(alloc, "testsecret", false);
     defer auth.deinit();
     try auth.addUser("ops:hunter2:admin");
+    try auth.addKey("metrics:testsecret:jobs_read");
     var bus = sse_mod.Bus.init(alloc);
     defer bus.deinit();
     var metrics = metrics_mod.Metrics.init(alloc);
@@ -242,7 +243,7 @@ test "live http smoke: healthz, api, auth gate, metrics" {
     }
     // metrics has our counter
     {
-        const r = try get(alloc, port, "/metrics", &.{});
+        const r = try get(alloc, port, "/metrics", &.{.{ .name = "authorization", .value = "Bearer metrics.testsecret" }});
         defer alloc.free(r.body);
         try std.testing.expectEqual(std.http.Status.ok, r.status);
         try std.testing.expect(std.mem.indexOf(u8, r.body, "beanline_jobs_enqueued_total{kind=\"emails.send\"} 1") != null);

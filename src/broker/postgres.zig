@@ -255,7 +255,9 @@ const Pg = struct {
         var lbuf: [24]u8 = undefined;
         const lms = try std.fmt.bufPrint(&lbuf, "{d}", .{lease_ms});
         var rows = try self.c.query(SQL_HB, &.{ ids_arr, ep_arr, lms });
+        const count = pg.Rows.rowCountFromTag(rows.command_tag) orelse 0;
         rows.deinit();
+        if (count == 0) return error.StaleLease;
     }
 
     fn idArray(buf: []u8, ids: []const i64) ![]const u8 {
@@ -441,7 +443,7 @@ fn heartbeatCb(ctx: *anyopaque, queue: []const u8, ids: []const i64, epochs: []c
     const self: *Pg = @ptrCast(@alignCast(ctx));
     self.mu.lock();
     defer self.mu.unlock();
-    try self.heartbeatImpl(queue, ids, epochs, lease_ms);
+    return try self.heartbeatImpl(queue, ids, epochs, lease_ms);
 }
 
 fn finishCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64) anyerror!void {

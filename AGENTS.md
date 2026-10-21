@@ -65,3 +65,28 @@ Lessons that cost the most time:
    - Build step: `zig build test-contract-install` then run `./zig-out/bin/test-contract` directly (NOT via `zig build test-contract`).
 
 2. **Always run `zig fmt --check src tests build.zig` before committing** — the CI fmt check step runs this on all three OSes and will fail the build if formatting is off. `src/dash/server.zig` has had formatting issues before; run `zig fmt src/dash/server.zig` to fix.
+
+## Mandatory Pre-Push Checklist (ALWAYS RUN)
+
+Before any commit/push, run ALL of the following locally and ensure they pass:
+
+```
+# 1. Build release
+zig build -Doptimize=ReleaseSafe
+
+# 2. Format check
+zig fmt --check src tests build.zig
+
+# 3. Unit tests (all platforms)
+zig build test
+
+# 4. Contract suite - PostgreSQL (requires local Postgres + BEANLINE_TEST_DSN)
+BEANLINE_TEST_DSN="postgres://..." BEANLINE_CONTRACT_REQUIRED=1 zig build test-contract-install
+./zig-out/bin/test-contract
+
+# 5. Contract suite - Redis (requires local Redis + BEANLINE_TEST_REDIS_URL)
+BEANLINE_TEST_REDIS_URL="redis://..." BEANLINE_CONTRACT_REQUIRED=1 zig build test-contract-install
+./zig-out/bin/test-contract
+```
+
+CI runs these on **all three OSes** (macOS, Ubuntu, Windows). Local green on Windows does NOT guarantee macOS/Ubuntu pass.

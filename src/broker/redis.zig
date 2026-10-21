@@ -171,7 +171,12 @@ const Redis = struct {
             try argv.append(try std.fmt.allocPrint(al, "{d}", .{id}));
             try argv.append(try std.fmt.allocPrint(al, "{d}", .{ep}));
         }
-        _ = try self.c.eval(al, heartbeat_lua, &.{}, argv.items);
+        const v = try self.c.eval(al, heartbeat_lua, &.{}, argv.items);
+        const ok = switch (v) {
+            .int => |i| i >= 1,
+            else => false,
+        };
+        if (!ok) return error.StaleLease;
     }
 
     fn finishImpl(self: *Redis, queue: []const u8, id: i64, lease_epoch: u64) !void {
