@@ -157,7 +157,7 @@ pub const Server = struct {
         const tv = std.posix.timeval{ .sec = 30, .usec = 0 };
         const bytes = std.mem.asBytes(&tv);
         const level: i32 = switch (@import("builtin").os.tag) {
-            .windows => 0xffff,
+            .windows, .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => 0xffff,
             else => 1,
         };
         const rcv: u32 = switch (@import("builtin").os.tag) {
