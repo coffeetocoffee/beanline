@@ -68,7 +68,6 @@ pub const Oidc = struct {
     default_role: []const u8 = "viewer",
 };
 
-/// True when the three fields required for the code flow are present.
 pub fn oidcConfigured(o: Oidc) bool {
     return o.authorize_endpoint.len > 0 and o.token_endpoint.len > 0 and o.client_id.len > 0;
 }
@@ -225,27 +224,58 @@ pub const Auth = struct {
         return true;
     }
 
+    /// Maximum number of concurrent login attempts tracked before eviction.
+const max_attempts: usize = 100;
+
     /// Attempt login. Returns the session token on success, or an error.
     /// Rate limited: after 5 consecutive failures the account is locked for
-    /// 60 seconds.
+    /// 60 seconds. Password verification is performed outside the mutex to
+    /// avoid serializing Argon2 behind a global lock; the attempts map is
+    /// capped to prevent unbounded growth from username spraying.
     pub fn login(self: *Auth, name: []const u8, password: []const u8, out_token: *[32]u8, out_csrf: *[32]u8) !void {
+        // 1. Verify password OUTSIDE the mutex (Argon2 is deliberately slow;
+        // holding it across the global mutex serializes all logins).
+        const password_correct = self.verifyPassword(name, password);
+
+        // 2. Lock mutex only to update attempt state and check lockout.
         self.mutex.lock();
         defer self.mutex.unlock();
+
         const now = std.time.milliTimestamp();
-        // The attempts map owns its keys; duplicate on first sight.
-        const owned: []const u8 = if (self.attempts.contains(name)) name else blk: {
-            const d = try self.alloc.dupe(u8, name);
-            errdefer self.alloc.free(d);
-            break :blk d;
-        };
-        const gop = try self.attempts.getOrPut(owned);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = owned;
-            gop.value_ptr.* = .{};
+
+        // 3. Attempt to get-or-put the attempt entry, capping map size.
+        //    When adding a new username, evict the oldest existing entry
+        //    to prevent unbounded growth from username spraying.
+        var key: []const u8 = name;
+        if (!self.attempts.contains(name)) {
+            // Evict oldest entry to cap memory usage.
+            var ait = self.attempts.keyIterator();
+            while (ait.next()) |k| {
+                // k is ?*const []const u8; dereference to get the key
+                const evict_key = k.*;
+                _ = self.alloc.free(evict_key);
+                _ = self.attempts.remove(evict_key);
+                break;
+            }
+            key = try self.alloc.dupe(u8, name);
+            errdefer self.alloc.free(key);
         }
+
+        const gop = try self.attempts.getOrPut(key);
+        if (!gop.found_existing) {
+            // New entry.
+            gop.key_ptr.* = key;
+            gop.value_ptr.* = .{};
+        } else {
+            // Existing entry: no counter to adjust; name was already tracked.
+        }
+
+        // 4. Check lockout regardless of password result.
         if (now < gop.value_ptr.locked_until_ms) return error.LockedOut;
 
-        if (!self.verifyPassword(name, password)) {
+        // 5. If password was wrong, increment failures and lock out.
+        if (!password_correct) {
+            // Increment failures; lockout after 5 consecutive failures.
             gop.value_ptr.failures += 1;
             if (gop.value_ptr.failures >= 5) {
                 gop.value_ptr.locked_until_ms = now + 60_000;
@@ -253,8 +283,8 @@ pub const Auth = struct {
             }
             return error.Unauthorized;
         }
-        gop.value_ptr.failures = 0;
 
+        // 6. Password correct — proceed with normal login (mutex already released).
         const idx = self.findUser(name) orelse return error.Unauthorized;
         var token: [32]u8 = undefined;
         var csrf: [32]u8 = undefined;
@@ -264,8 +294,8 @@ pub const Auth = struct {
             .token = token,
             .csrf = csrf,
             .user_idx = idx,
-            .created_ms = now,
-            .last_seen_ms = now,
+            .created_ms = std.time.milliTimestamp(),
+            .last_seen_ms = std.time.milliTimestamp(),
         });
         out_token.* = token;
         out_csrf.* = csrf;

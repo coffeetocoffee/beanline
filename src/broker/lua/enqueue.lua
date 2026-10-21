@@ -6,7 +6,6 @@ local run_at = tonumber(ARGV[5])
 local maxa = ARGV[6]
 local uniq = ARGV[7]
 local dedup = ARGV[8]
-local ctx = ARGV[9]
 -- Get time from Redis server to avoid clock skew between workers
 local time_obj = redis.call('TIME')
 local now_ms = tonumber(time_obj[1]) * 1000 + math.floor(tonumber(time_obj[2]) / 1000)
@@ -15,15 +14,32 @@ local status = 'available'
 if run_at > now_ms then status = 'scheduled' end
 local id = redis.call('INCR', 'beanline:seq')
 local jk = prefix .. ':job:' .. id
+
+-- Compute TTL based on run_at so uniqueness/dedup guards persist until the
+-- scheduled job runs, rather than expiring at fixed times from enqueue time.
+-- Grace periods ensure the guard outlasts the job's execution.
+local function compute_ttl(run_at_ms, now_ms, grace_sec)
+    local diff_ms = run_at_ms - now_ms
+    if diff_ms > 0 then
+        -- TTL = (run_at - now) + grace, in seconds; ensure at least 1s.
+        return math.max(diff_ms / 1000 + grace_sec, 1)
+    else
+        -- Job is due or past due; use grace from enqueue time.
+        return math.max(grace_sec, 1)
+    end
+end
+
 if dedup ~= '' then
   local dk = 'beanline:sched:' .. kind .. ':' .. dedup
-  if redis.call('SET', dk, id, 'NX', 'EX', 172800) == false then
+  local dedup_ttl = compute_ttl(run_at, now_ms, 172800) -- 48h default grace, extended from run_at
+  if redis.call('SET', dk, id, 'NX', 'EX', dedup_ttl) == false then
     return { 0, redis.call('GET', dk) }
   end
 end
 if uniq ~= '' then
   local guard = prefix .. ':guard:' .. kind .. ':' .. uniq
-  if redis.call('SET', guard, id, 'NX', 'EX', 86400) == false then
+  local guard_ttl = compute_ttl(run_at, now_ms, 86400) -- 24h default grace, extended from run_at
+  if redis.call('SET', guard, id, 'NX', 'EX', guard_ttl) == false then
     if dedup ~= '' then
       redis.call('DEL', 'beanline:sched:' .. kind .. ':' .. dedup)
     end
