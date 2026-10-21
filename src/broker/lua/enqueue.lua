@@ -55,7 +55,7 @@ redis.call('HSET', jk,
   'queue', q, 'kind', kind, 'args', args, 'priority', prio,
   'status', status, 'attempts', '0', 'max_attempts', maxa, 'epoch', '0',
   'unique', uniq, 'dedup', dedup, 'run_at', tostring(run_at),
-  'context', ctx, 'inserted_at', tostring(now_ms))
+  'context', ARGV[9], 'inserted_at', tostring(now_ms))
 if status == 'available' then
   redis.call('LPUSH', prefix .. ':ready:' .. prio, id)
 else
