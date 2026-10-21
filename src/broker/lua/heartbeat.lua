@@ -15,5 +15,6 @@ while i + 1 <= #ARGV do
       extended = extended + 1
     end
   end
+  -- Stale epoch or non-running job: noop (contract test expects no error)
 end
 return extended

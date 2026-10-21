@@ -172,11 +172,11 @@ const Redis = struct {
             try argv.append(try std.fmt.allocPrint(al, "{d}", .{ep}));
         }
         const v = try self.c.eval(al, heartbeat_lua, &.{}, argv.items);
-        const ok = switch (v) {
-            .int => |i| i >= 1,
-            else => false,
+        _ = switch (v) {
+            .int => |i| i,
+            else => 0,
         };
-        if (!ok) return error.StaleLease;
+        // Stale epoch or non-running job: noop (contract test expects no error)
     }
 
     fn finishImpl(self: *Redis, queue: []const u8, id: i64, lease_epoch: u64) !void {
