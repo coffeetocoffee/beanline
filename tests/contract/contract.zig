@@ -848,6 +848,21 @@ const runtime_flaky = beanline.Kind(RuntimeMailArgs, error{Transient}).new(.{
     }.run,
 });
 
+/// A kind with a two-attempt budget. The budget is a property of the kind,
+/// so it holds however the job was enqueued.
+const runtime_bounded = beanline.Kind(RuntimeMailArgs, error{Transient}).new(.{
+    .name = "ct.bounded",
+    .queue = "default",
+    .max_attempts = 2,
+    .errors = .{ .retryable = &.{error.Transient} },
+    .retry = .{ .base_ms = 10, .cap_ms = 50 },
+    .handle = struct {
+        fn run(_: *beanline.JobContext, _: RuntimeMailArgs) error{Transient}!void {
+            return error.Transient;
+        }
+    }.run,
+});
+
 fn runtimeRegistry() !beanline.Registry {
     var reg = beanline.Registry.init(std.testing.allocator);
     errdefer reg.deinit();
@@ -855,6 +870,7 @@ fn runtimeRegistry() !beanline.Registry {
     try reg.register(beanline.entryForKind(@TypeOf(runtime_invoice), runtime_invoice));
     try reg.register(beanline.entryForKind(@TypeOf(runtime_dead), runtime_dead));
     try reg.register(beanline.entryForKind(@TypeOf(runtime_flaky), runtime_flaky));
+    try reg.register(beanline.entryForKind(@TypeOf(runtime_bounded), runtime_bounded));
     return reg;
 }
 
@@ -998,6 +1014,48 @@ fn case_runtime_retryable_error_is_retried(f: *Fixture) !void {
 
 // ---------------------------------------------------------------- case list
 
+/// The kind's attempt budget holds even when the producer did not know the
+/// kind. The job is enqueued with the broker's default budget of 25, as an
+/// unaware producer would, and the worker must still stop at the kind's
+/// bound of two attempts.
+fn case_runtime_kind_budget_bounds_the_row(f: *Fixture) !void {
+    var reg = try runtimeRegistry();
+    defer reg.deinit();
+
+    const enq = try f.enqueue("ct.bounded", "{\"to\":\"a\",\"subject\":\"s\"}", .{
+        .queue = f.queue,
+        .run_at_ms = 0,
+        .max_attempts = 25,
+    });
+
+    try driveOwner(f, &reg, 10000, stopDead);
+
+    const row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.dead, row.status);
+    // Two attempts, not the row's 25 and not one.
+    try std.testing.expectEqual(@as(u32, 2), row.attempts);
+}
+
+/// The tighter of the two budgets wins. A kind may ask for more attempts than
+/// the job was enqueued with, but it cannot get them.
+fn case_runtime_tighter_budget_wins(f: *Fixture) !void {
+    var reg = try runtimeRegistry();
+    defer reg.deinit();
+
+    // The kind allows 25 attempts, the job was enqueued with 2.
+    const enq = try f.enqueue("ct.flaky", "{\"to\":\"a\",\"subject\":\"s\"}", .{
+        .queue = f.queue,
+        .run_at_ms = 0,
+        .max_attempts = 2,
+    });
+
+    try driveOwner(f, &reg, 10000, stopDead);
+
+    const row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.dead, row.status);
+    try std.testing.expectEqual(@as(u32, 2), row.attempts);
+}
+
 pub const contract_cases = [_]harness.Case{
     .{ .name = "enqueue-immediately-available", .queue = "enqueue-now", .run = case_enqueue_now_available },
     .{ .name = "enqueue-future-is-scheduled", .queue = "enqueue-future", .run = case_enqueue_future_scheduled },
@@ -1055,6 +1113,8 @@ pub const contract_cases = [_]harness.Case{
     .{ .name = "runtime-dead-classification-fails-fast", .queue = "rt-dead", .run = case_runtime_dead_classification_fails_fast },
     .{ .name = "runtime-bad-payload-dead-on-first-attempt", .queue = "rt-badpay", .run = case_runtime_bad_payload_is_dead_on_first_attempt },
     .{ .name = "runtime-retryable-error-is-retried", .queue = "rt-retry", .run = case_runtime_retryable_error_is_retried },
+    .{ .name = "runtime-kind-budget-bounds-the-row", .queue = "rt-budget", .run = case_runtime_kind_budget_bounds_the_row },
+    .{ .name = "runtime-tighter-budget-wins", .queue = "rt-tight", .run = case_runtime_tighter_budget_wins },
 };
 
 pub const divergence_probes = [_]harness.Probe{

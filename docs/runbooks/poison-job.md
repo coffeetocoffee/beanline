@@ -70,11 +70,13 @@ Options, safest first:
 3. **Discard the job** once the evidence is captured and it cannot ever succeed.
    This is terminal; the event log keeps the record.
 
-4. **Cap the damage with the budget.** `max_attempts` is set per job when it
-   is enqueued, so a producer that keeps re-enqueueing the same payload is the
-   thing to fix: give it a lower `max_attempts` (or stop re-enqueueing) and
-   pause the queue until the producer is fixed. Every retry costs real handler
-   time.
+4. **Cap the damage with the budget.** The attempt budget is an upper bound,
+   and the worker enforces the kind's `max_attempts` however the job was
+   enqueued, so lowering it on the kind takes effect immediately for every
+   job of that kind, including the ones already queued. A producer that
+   keeps re-enqueueing the same payload is the other half of the problem:
+   stop re-enqueueing, and pause the queue until the producer is fixed.
+   Every retry costs real handler time.
 
 ## Quarantine a kind that kills its worker
 

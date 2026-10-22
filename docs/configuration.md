@@ -41,7 +41,7 @@ kinds that do not declare a backoff of their own.
 | `BEANLINE_RETRY_CAP_MS` | `1800000` (30 min) | Maximum delay between attempts. |
 | `BEANLINE_RETRY_FACTOR` | `2.0` | Growth factor of the exponential backoff. |
 | `BEANLINE_RETRY_JITTER` | `full` | Jitter mode: `none`, `full`, `equal` or `decorrelated`. |
-| `BEANLINE_MAX_ATTEMPTS` | `25` | Attempt budget for jobs enqueued for a kind this process does not know. A kind that is known uses its own `max_attempts`. |
+| `BEANLINE_MAX_ATTEMPTS` | `25` | Attempt budget for jobs enqueued for a kind this process does not know. A kind that is known uses its own `max_attempts`, and the worker enforces the tighter of the two. |
 
 ## Retention
 

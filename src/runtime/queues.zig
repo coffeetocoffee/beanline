@@ -302,15 +302,26 @@ pub const Owner = struct {
     fn reportFailure(self: *Owner, d: *Dispatch, qname: []const u8) !void {
         const f = d.outcome.failed;
         var out = broker_mod.FailOutcome{};
+        // Two bounds on the attempt budget: the one stored on the job row
+        // when it was enqueued, and the one the kind declares. Both are upper
+        // bounds, so the effective budget is the smaller of the two, and the
+        // broker enforces the row's side on its own.
+        //
+        // The worker enforces the kind's bound even when the producer did
+        // not know the kind, so a kind that says "three strikes and
+        // dead-letter" is never given more than three attempts.
+        const kind_budget: u32 = d.entry.max_attempts;
+        const may_retry = f.class == .retryable and d.attempts < kind_budget;
         var retry_at: i64 = 0;
-        if (f.class == .retryable) {
+        if (may_retry) {
             const bo = d.entry.retry orelse self.default_retry;
             var prng = std.Random.DefaultPrng.init(@bitCast(@as(u64, @intCast(d.id)) ^ (@as(u64, d.attempts) << 8)));
             const delay = bo.delayMs(d.attempts + 1, 0, prng.random());
             retry_at = std.time.milliTimestamp() + @as(i64, @intCast(delay));
         }
-        // A dead error never gets a retry_at: the broker dead-letters it now.
-        self.broker.fail(qname, d.id, d.epoch, f.name, f.class == .retryable, retry_at, &out) catch |e| {
+        // A dead error, or an exhausted budget, never gets a retry_at: the
+        // broker dead-letters the job now.
+        self.broker.fail(qname, d.id, d.epoch, f.name, may_retry, retry_at, &out) catch |e| {
             std.log.warn("fail id={d}: {s}", .{ d.id, @errorName(e) });
         };
     }

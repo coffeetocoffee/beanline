@@ -99,10 +99,11 @@ pub fn Kind(comptime Args: type, comptime E: type) type {
             /// Attempts before the job dead-letters, unless the error is
             /// classified as dead (which dead-letters immediately).
             ///
-            /// The budget is stored on the job when it is enqueued, so it
-            /// only applies to enqueues made by a process that knows the
-            /// kind. A job enqueued by a process that does not know the kind
-            /// gets the broker's default.
+            /// This is an upper bound, and so is the budget stored on the job
+            /// when it was enqueued. The effective budget is the smaller of
+            /// the two. The worker enforces this one even when the producer
+            /// did not know the kind, so a kind that says "three strikes and
+            /// dead-letter" is never given more than three attempts.
             max_attempts: u8 = 25,
             /// Cooperative per-execution deadline in ms; 0 disables.
             timeout_ms: u32 = 0,

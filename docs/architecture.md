@@ -672,6 +672,13 @@ untrusted code paths this exists for.
   executes because a worker died between claim and start still consumed an
   attempt; the refund is unconditional in this release, so infrastructure
   flakiness does not burn budgets.
+- The attempt budget has two bounds: the one stored on the job row when it
+  was enqueued, and the one the kind declares (`Kind.Spec.max_attempts`).
+  Both are upper bounds, so the effective budget is the smaller of the two.
+  The worker enforces the kind's bound even when the producer did not know
+  the kind, so a kind that says "three strikes and dead-letter" is never
+  given more than three attempts. An error classified as dead skips the
+  budget entirely and dead-letters on the first attempt.
 - Crash loops are caught by a separate counter that is never refunded:
   `lease_losses`, bounded per job by `max_lease_losses` (default 3). The
   sandbox's `max_crash_attempts` (section 9.7) is the same idea observed

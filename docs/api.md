@@ -69,7 +69,9 @@ the dashboard does not know is accepted: the worker tier owns that kind's
 schema.
 
 When the kind is known, its own `queue` and `max_attempts` are used unless
-the request overrides the queue.
+the request overrides the queue. The attempt budget is an upper bound the
+worker enforces whatever the row says, so a kind that declares a smaller
+budget than the row still gets the smaller one.
 
 ### Schedules
 

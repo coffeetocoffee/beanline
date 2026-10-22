@@ -72,7 +72,8 @@ OOM-killed, or panicked, and the worker process died with it each time. See
 ## Prevention
 
 - Raise `max_attempts` (and the retry cap) only for kinds that are genuinely
-  tolerant of long outages, not to silence a surge.
+  tolerant of long outages, not to silence a surge. The kind's budget is the
+  tighter of the two bounds, so raising it on the kind is what takes effect.
 - Alert on `dead_rate` per kind, not on the absolute dead count.
 - Scheduled bulk replays get `jitter_ms`, but manual replays do not: always
   replay in batches.
