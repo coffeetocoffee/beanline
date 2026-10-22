@@ -4,6 +4,12 @@
 mock), so the numbers include the database round trips that dominate a real
 queue.
 
+The bench workers resolve each job's kind through the registry and run it
+through the same path a production worker uses: the payload is decoded into
+the kind's own argument type, the handler runs, and the error is classified by
+the kind. A payload that does not fit the kind's schema is a permanent
+failure, not a retry.
+
 ## Running a bench
 
 ```sh
@@ -26,7 +32,7 @@ beanline bench --workload noop --duration 120 --warmup 10 \
 | `--claim-batch <n>` | Jobs claimed per round trip (default 4) |
 | `--seed <n>` | PRNG seed, so failure injection is reproducible |
 | `--report <path>` | Write a JSON report |
-| `--gate` | Compare against the stored reference, fail on a p99 regression |
+| `--gate` | Compare against the stored reference, fail on >5% p99 regression |
 | `--gate-pct <pct>` | Regression budget (default 5) |
 | `--dry-run` | Print the plan and exit without touching a broker |
 
@@ -43,6 +49,44 @@ beanline bench --workload noop --duration 120 --warmup 10 \
 ### Reported metrics
 
 - `enqueued`, `claimed`, `completed`, `failed (retryable)`, `failed (permanent)`, `errors`
+- `queue depth`: jobs waiting when the measurement window opened and when it
+  closed
+- `claim p50/p99`, `run p50/p99`, `e2e p50/p99`, `throughput`
+
+### Connections, and why the numbers are repeatable
+
+A broker connection is one request/response stream, so it serves one command
+at a time. The bench gives **each worker its own connection** and the
+producers their own, the way a deployment does: one connection per worker
+process, plus whatever the producers use.
+
+This matters more than it sounds. A claim costs roughly ten times an enqueue
+(about 7 ms against 1.3 ms on a local Postgres, and the claim is `O(queue
+depth)` because it sorts the waiting jobs by age). When the workers and the
+producers shared one connection, the producers took it away from the workers:
+the same command reported 16, 16 and 848 claimed jobs on three consecutive
+runs, and a throughput that swung by a factor of fifty. With one connection
+per worker the same command reports 5083, 4679 and 4174, and the workers
+drain everything they are given.
+
+### Reading a report
+
+- `queue depth` near zero throughout means the workers kept up and the run
+  measured steady state.
+- A depth that grows across the window means the run saturated: the queue was
+  the bottleneck, and the claim cost was rising with the depth. That is a
+  legitimate thing to measure, but it is not a latency measurement of the
+  broker.
+- `claimed` is bounded by what the workers drained, not by what the producers
+  enqueued. A saturating run enqueues far more than it claims.
+- `--rate` caps the producer rate. It is the way to get a steady-state run:
+  pick a rate the workers can drain, and the queue stays shallow and the
+  latencies are comparable between runs. The rate limiter schedules each
+  producer's next slot from the moment it actually enqueued, so the rate does
+  not drift.
+
+### Latency series
+
 - `claim p50/p99`: time from enqueue to claim (the queue latency users feel)
 - `run p50/p99`: handler duration
 - `e2e p50/p99`: enqueue to terminal state

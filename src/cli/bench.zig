@@ -1,5 +1,28 @@
 const std = @import("std");
 const broker_mod = @import("../broker/broker.zig");
+const registry_mod = @import("../core/registry.zig");
+const job_mod = @import("../core/job.zig");
+const backoff_mod = @import("../runtime/backoff.zig");
+
+/// The payload shape the bench kinds accept. The bench goes through the real
+/// per-kind path: the payload is decoded into this type and the handler's
+/// error is classified by the kind, not by a hand-rolled string comparison in
+/// the worker loop.
+const BenchArgs = struct { to: []const u8, subject: []const u8 };
+
+/// A counter the failure-injecting handlers draw from. It is mixed with the
+/// attempt number so a retried job gets a different outcome each time, which
+/// is what makes the `flaky` workload eventually succeed.
+var bench_entropy = std.atomic.Value(u64).init(0x243f6a8885a308d3);
+
+fn nextEntropy() u64 {
+    return bench_entropy.fetchAdd(0x9e3779b97f4a7c15, .monotonic);
+}
+
+fn benchSeed(ctx: *job_mod.Context) u64 {
+    const job_id: u64 = @bitCast(ctx.job_id);
+    return nextEntropy() ^ (job_id *% 0x2545f4914f6cdd1d) ^ (@as(u64, ctx.attempt) << 32);
+}
 
 /// Workload shapes from the architecture doc's Ã‚Â§19 benchmark table.
 pub const Workload = enum {
@@ -208,6 +231,10 @@ pub const Result = struct {
     duration: Samples = .{},
     e2e: Samples = .{},
     errors: u64 = 0,
+    /// Jobs waiting when the measurement window opened.
+    depth_start: u64 = 0,
+    /// Jobs waiting when the measurement window closed.
+    depth_end: u64 = 0,
 
     pub fn throughput(self: *const Result) f64 {
         if (self.elapsed_ms <= 0) return 0;
@@ -254,6 +281,8 @@ fn resultToJson(alloc: std.mem.Allocator, r: *const Result) ![]u8 {
         \\  "failed_retryable": {d},
         \\  "failed_permanent": {d},
         \\  "errors": {d},
+        \\  "depth_start": {d},
+        \\  "depth_end": {d},
         \\  "claim_p50_ms": {d:.3},
         \\  "claim_p99_ms": {d:.3},
         \\  "duration_p50_ms": {d:.3},
@@ -269,6 +298,7 @@ fn resultToJson(alloc: std.mem.Allocator, r: *const Result) ![]u8 {
         r.claimed,                                       r.completed,
         r.failed_retryable,                              r.failed_permanent,
         r.errors,                                        @divTrunc(r.claim_latency.percentile(50), 1000),
+        r.depth_start,                                   r.depth_end,
         @divTrunc(r.claim_latency.percentile(99), 1000), @divTrunc(r.duration.percentile(50), 1000),
         @divTrunc(r.duration.percentile(99), 1000),      @divTrunc(r.e2e.percentile(50), 1000),
         @divTrunc(r.e2e.percentile(99), 1000),           r.throughput(),
@@ -286,26 +316,62 @@ const WorkerState = struct {
     claim_latency: Samples = .{},
     duration: Samples = .{},
     e2e: Samples = .{},
-    rng: std.Random = undefined,
     measure: *std.atomic.Value(bool),
 
     fn init(alloc: std.mem.Allocator, seed: u64, measure: *std.atomic.Value(bool)) WorkerState {
-        var rng = std.Random.DefaultPrng.init(seed);
         return .{
             .alloc = alloc,
             .measure = measure,
             .claim_latency = Samples.init(seed ^ 0xaaaa),
             .duration = Samples.init(seed ^ 0xbbbb),
             .e2e = Samples.init(seed ^ 0xcccc),
-            .rng = rng.random(),
         };
+    }
+};
+
+/// The connections a bench run uses.
+///
+/// A broker connection is a single request/response stream, so it can only
+/// serve one command at a time. When the producers and the workers share one
+/// connection, every worker claim queues behind the producer inserts, and the
+/// bench measures the producer's insert rate rather than the system's drain
+/// rate. Giving each worker its own connection, and the producers their own,
+/// is what a deployment actually looks like: one connection per worker
+/// process, plus whatever the producers use.
+pub const Connections = struct {
+    /// One connection per worker thread. A worker uses
+    /// `workers[index % workers.len]` for the whole run.
+    workers: []const broker_mod.Broker = &.{},
+    /// Connections the producer threads share.
+    producers: []const broker_mod.Broker = &.{},
+
+    pub fn worker(self: Connections, index: u16) broker_mod.Broker {
+        if (self.workers.len == 0) return self.producers[0];
+        return self.workers[index % self.workers.len];
+    }
+
+    pub fn producer(self: Connections, index: u16) broker_mod.Broker {
+        if (self.producers.len == 0) return self.workers[0];
+        return self.producers[index % self.producers.len];
     }
 };
 
 const Shared = struct {
     alloc: std.mem.Allocator,
     opts: Options,
-    broker: broker_mod.Broker,
+    /// The connections the bench uses. A worker owns its connection for the
+    /// whole run, the way a worker process owns its connection: sharing one
+    /// connection between the workers and the producers makes the connection
+    /// the contended resource, and the faster producer takes it away from the
+    /// slower workers. The numbers then measure the producer, not the system.
+    conns: Connections,
+    /// Guards the claim-and-copy critical section. A claimed payload points
+    /// into the broker's claim buffer, which the next claim on the same
+    /// connection overwrites, so a worker must copy its payload before
+    /// another worker claims on that connection.
+    claim_mu: std.Thread.Mutex = .{},
+    /// The kinds the workers resolve jobs through. Shared read-only.
+    reg: *const registry_mod.Registry,
     states: []WorkerState,
     enqueued: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     producer_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -323,36 +389,89 @@ fn buildArgsJson(alloc: std.mem.Allocator, payload_bytes: u16) ![]u8 {
     return std.fmt.allocPrint(alloc, "{{\"to\":\"{s}\",\"subject\":\"{s}\"}}", .{ buf, buf });
 }
 
-/// Simulate the handler cost for the selected workload.
-const WorkerCtx = struct {
-    rng: std.Random,
-    scratch: u64 = 0x9e3779b97f4a7c15,
+/// The bench kinds. Each one is a real kind with its own error
+/// classification, so the bench exercises the same path a production worker
+/// does: decode the payload into the kind's argument type, run the handler,
+/// classify the error, and retry or dead-letter accordingly.
+const noop_kind = job_mod.Kind(BenchArgs, error{}).new(.{
+    .name = "bench.noop",
+    .queue = "default",
+    .handle = struct {
+        fn run(_: *job_mod.Context, _: BenchArgs) error{}!void {}
+    }.run,
+});
 
-    fn run(w: *WorkerCtx, workload: Workload) anyerror!void {
-        switch (workload) {
-            .noop => {},
-            .io => std.time.sleep(20 * std.time.ns_per_ms),
-            .cpu => {
-                var acc: u64 = w.scratch;
-                const until = std.time.milliTimestamp() + 10;
-                while (std.time.milliTimestamp() < until) {
-                    acc = acc *% 6364136223846793005 +% 1442695040888963407;
-                }
-                w.scratch = acc;
-            },
-            .flaky => if (w.rng.uintLessThan(u8, 10) == 0) return error.BenchTransient,
-            .poison => if (w.rng.uintLessThan(u8, 100) == 0) return error.BenchPermanent,
+const io_kind = job_mod.Kind(BenchArgs, error{}).new(.{
+    .name = "bench.io",
+    .queue = "default",
+    .handle = struct {
+        fn run(_: *job_mod.Context, _: BenchArgs) error{}!void {
+            std.time.sleep(20 * std.time.ns_per_ms);
         }
-    }
-};
+    }.run,
+});
+
+const cpu_kind = job_mod.Kind(BenchArgs, error{}).new(.{
+    .name = "bench.cpu",
+    .queue = "default",
+    .handle = struct {
+        fn run(_: *job_mod.Context, _: BenchArgs) error{}!void {
+            var acc: u64 = 0x9e3779b97f4a7c15;
+            const until = std.time.milliTimestamp() + 10;
+            while (std.time.milliTimestamp() < until) {
+                acc = acc *% 6364136223846793005 +% 1442695040888963407;
+            }
+            std.mem.doNotOptimizeAway(acc);
+        }
+    }.run,
+});
+
+/// 10% transient failures: retryable, so the job goes back on the queue.
+const flaky_kind = job_mod.Kind(BenchArgs, error{BenchTransient}).new(.{
+    .name = "bench.flaky",
+    .queue = "default",
+    .errors = .{ .retryable = &.{error.BenchTransient} },
+    .handle = struct {
+        fn run(ctx: *job_mod.Context, _: BenchArgs) error{BenchTransient}!void {
+            var prng = std.Random.DefaultPrng.init(benchSeed(ctx));
+            if (prng.random().uintLessThan(u8, 10) == 0) return error.BenchTransient;
+        }
+    }.run,
+});
+
+/// 1% permanent failures: dead, so the job dead-letters on the first
+/// attempt that hits it.
+const poison_kind = job_mod.Kind(BenchArgs, error{BenchPermanent}).new(.{
+    .name = "bench.poison",
+    .queue = "default",
+    .errors = .{ .dead_on = &.{error.BenchPermanent} },
+    .handle = struct {
+        fn run(ctx: *job_mod.Context, _: BenchArgs) error{BenchPermanent}!void {
+            var prng = std.Random.DefaultPrng.init(benchSeed(ctx));
+            if (prng.random().uintLessThan(u8, 100) == 0) return error.BenchPermanent;
+        }
+    }.run,
+});
+
+/// The registry the bench workers resolve kinds through.
+fn setupRegistry(alloc: std.mem.Allocator) !registry_mod.Registry {
+    var reg = registry_mod.Registry.init(alloc);
+    errdefer reg.deinit();
+    try reg.register(registry_mod.entryFor(@TypeOf(noop_kind), noop_kind));
+    try reg.register(registry_mod.entryFor(@TypeOf(io_kind), io_kind));
+    try reg.register(registry_mod.entryFor(@TypeOf(cpu_kind), cpu_kind));
+    try reg.register(registry_mod.entryFor(@TypeOf(flaky_kind), flaky_kind));
+    try reg.register(registry_mod.entryFor(@TypeOf(poison_kind), poison_kind));
+    return reg;
+}
 
 fn workerThread(shared: *Shared, index: u16) void {
     const alloc = shared.alloc;
+    const broker = shared.conns.worker(index);
     var st = shared.states[index];
     defer {
         shared.states[index] = st;
     }
-    var wctx = WorkerCtx{ .rng = st.rng };
     const worker_id_buf = std.fmt.allocPrint(alloc, "bench-{d}", .{index}) catch return;
     defer alloc.free(worker_id_buf);
 
@@ -360,13 +479,48 @@ fn workerThread(shared: *Shared, index: u16) void {
     var epochs: [64]u64 = undefined;
     var batch: [64]broker_mod.Claimed = undefined;
 
+    // A claimed payload points into the broker's claim buffer, which the next
+    // claim on the same connection overwrites. Copy it out while the claim is
+    // still ours, the way the runtime does before it hands the job to a pool
+    // thread. The bench shares one connection between its worker threads, so
+    // the copy has to happen under a lock.
+    var args_store: std.ArrayListUnmanaged(u8) = .{};
+    defer args_store.deinit(alloc);
+    var args_off: [64]usize = undefined;
+    var args_len: [64]usize = undefined;
+
+    // The bench enqueues one kind for the whole run, so the kind is resolved
+    // once here. It must not be read from the claimed job: a claimed job's
+    // strings point into the broker's claim buffer, which the next claim on
+    // the same connection overwrites.
+    const entry: ?registry_mod.Entry = shared.reg.get(shared.opts.workload.kindName());
+
     while (!shared.stop.load(.seq_cst)) {
         const queue = shared.queue_names[index % shared.queue_names.len];
-        const n = shared.broker.claim(queue, @min(shared.opts.claim_batch, batch.len), worker_id_buf, shared.opts.lease_ms, &batch) catch {
+        shared.claim_mu.lock();
+        const n = broker.claim(queue, @min(shared.opts.claim_batch, batch.len), worker_id_buf, shared.opts.lease_ms, &batch) catch {
+            shared.claim_mu.unlock();
             st.errors += 1;
             std.time.sleep(20 * std.time.ns_per_ms);
             continue;
         };
+        var copy_ok = true;
+        args_store.clearRetainingCapacity();
+        for (batch[0..n], 0..) |c, k| {
+            const start = args_store.items.len;
+            args_store.appendSlice(alloc, c.args_json) catch {
+                copy_ok = false;
+                break;
+            };
+            args_off[k] = start;
+            args_len[k] = args_store.items.len - start;
+        }
+        shared.claim_mu.unlock();
+
+        if (!copy_ok) {
+            st.errors += 1;
+            continue;
+        }
         if (n == 0) {
             std.time.sleep(2 * std.time.ns_per_ms);
             continue;
@@ -374,6 +528,7 @@ fn workerThread(shared: *Shared, index: u16) void {
         var k: usize = 0;
         while (k < n) : (k += 1) {
             const job = batch[k];
+            const args_json = args_store.items[args_off[k]..][0..args_len[k]];
             const now = std.time.milliTimestamp();
             st.claimed += 1;
             if (shared.measure.load(.seq_cst)) {
@@ -381,28 +536,47 @@ fn workerThread(shared: *Shared, index: u16) void {
             }
 
             const started = std.time.milliTimestamp();
-            const outcome: anyerror!void = WorkerCtx.run(&wctx, shared.opts.workload);
+            // The real runtime path: decode the payload into the kind's own
+            // argument type, run the handler, classify the error.
+            var outcome: job_mod.Outcome = .{ .failed = .{ .class = .dead, .name = "unknown_kind" } };
+            if (entry) |e| {
+                var ctx = job_mod.Context{
+                    .job_id = job.id,
+                    .lease_epoch = job.lease_epoch,
+                    .attempt = @intCast(@min(job.attempts, 255)),
+                    .alloc = alloc,
+                };
+                outcome = e.runner(&ctx, alloc, args_json);
+            }
             const finished = std.time.milliTimestamp();
             if (shared.measure.load(.seq_cst)) {
                 st.duration.add(alloc, @intCast(@max(0, finished - started) * 1000)) catch {};
                 st.e2e.add(alloc, @intCast(@max(0, finished - job.run_at_ms) * 1000)) catch {};
             }
 
-            if (outcome) |_| {
-                shared.broker.finish(queue, job.id, job.lease_epoch) catch {
-                    st.errors += 1;
-                    continue;
-                };
-                st.completed += 1;
-            } else |err| {
-                const permanent = err == error.BenchPermanent;
-                var fo = broker_mod.FailOutcome{};
-                const retry_at = if (permanent) 0 else std.time.milliTimestamp() + 1000;
-                shared.broker.fail(queue, job.id, job.lease_epoch, @errorName(err), !permanent, retry_at, &fo) catch {
-                    st.errors += 1;
-                    continue;
-                };
-                if (permanent) st.failed_permanent += 1 else st.failed_retryable += 1;
+            switch (outcome) {
+                .ok => {
+                    broker.finish(queue, job.id, job.lease_epoch) catch {
+                        st.errors += 1;
+                        continue;
+                    };
+                    st.completed += 1;
+                },
+                .failed => |f| {
+                    const retryable = f.class == .retryable;
+                    var fo = broker_mod.FailOutcome{};
+                    var retry_at: i64 = 0;
+                    if (retryable) {
+                        const bo = if (entry) |e| (e.retry orelse backoff_mod.Backoff{}) else backoff_mod.Backoff{};
+                        var prng = std.Random.DefaultPrng.init(@bitCast(@as(u64, @intCast(job.id))));
+                        retry_at = std.time.milliTimestamp() + @as(i64, @intCast(bo.delayMs(job.attempts + 1, 0, prng.random())));
+                    }
+                    broker.fail(queue, job.id, job.lease_epoch, f.name, retryable, retry_at, &fo) catch {
+                        st.errors += 1;
+                        continue;
+                    };
+                    if (retryable) st.failed_retryable += 1 else st.failed_permanent += 1;
+                },
             }
             if (k < ids.len) {
                 ids[k] = job.id;
@@ -411,31 +585,71 @@ fn workerThread(shared: *Shared, index: u16) void {
         }
         // One batched heartbeat per tick, mirroring the runtime's design.
         if (n > 0) {
-            shared.broker.heartbeat(queue, ids[0..@min(n, ids.len)], epochs[0..@min(n, epochs.len)], shared.opts.lease_ms) catch {
+            broker.heartbeat(queue, ids[0..@min(n, ids.len)], epochs[0..@min(n, epochs.len)], shared.opts.lease_ms) catch {
                 st.errors += 1;
             };
         }
     }
-    st.rng = wctx.rng;
+}
+
+/// What a rate-limited producer should do at a given moment.
+pub const RateDecision = struct {
+    /// Nanoseconds to sleep before looking again. Zero means "enqueue now".
+    sleep_ns: u64,
+    /// True when the producer may enqueue a job.
+    enqueue: bool,
+};
+
+/// Decide whether a producer may enqueue at `now_ns`.
+///
+/// `next_ns` is the time of the next permitted enqueue and `period_ns` the
+/// spacing between enqueues.
+///
+/// The schedule is relative to the moment the producer actually enqueues, not
+/// to a running total. A running total drifts ahead of the wall clock every
+/// time the sleep is capped, and it never catches up: the deadline moves
+/// further away than the clock does, so the producer waits forever and
+/// enqueues nothing at all.
+pub fn rateDecision(now_ns: i128, next_ns: i128) RateDecision {
+    if (now_ns < next_ns) {
+        const wait: i128 = next_ns - now_ns;
+        return .{
+            // Cap the sleep so a producer still notices the stop flag (and a
+            // shutdown) promptly.
+            .sleep_ns = @intCast(@min(wait, @as(i128, 20 * std.time.ns_per_ms))),
+            .enqueue = false,
+        };
+    }
+    return .{ .sleep_ns = 0, .enqueue = true };
+}
+
+/// The spacing between enqueues for one producer thread, in nanoseconds.
+pub fn ratePeriodNs(rate: u32, producers: u16) i128 {
+    if (rate == 0) return 0;
+    const per_thread: u32 = @max(1, rate / @max(1, producers));
+    return @divTrunc(@as(i128, std.time.ns_per_s), per_thread);
 }
 
 fn producerThread(shared: *Shared, index: u16) void {
     const alloc = shared.alloc;
+    const broker = shared.conns.producer(index);
     var prng = std.Random.Xoshiro256.init(shared.opts.seed ^ (0x1000 + index));
-    const per_thread_rate: u32 = if (shared.opts.rate == 0) 0 else @max(1, shared.opts.rate / @max(1, shared.opts.producers));
+    const period_ns = ratePeriodNs(shared.opts.rate, shared.opts.producers);
     var next_ns = std.time.nanoTimestamp();
     while (!shared.stop.load(.seq_cst)) {
         if (shared.opts.rate != 0) {
-            next_ns += @divTrunc(@as(i64, per_thread_rate) * std.time.ns_per_s, 1000);
             const now_ns = std.time.nanoTimestamp();
-            if (next_ns > now_ns) {
-                std.time.sleep(@intCast(@min(next_ns - now_ns, @as(i64, 20 * std.time.ns_per_ms))));
+            const d = rateDecision(now_ns, next_ns);
+            if (!d.enqueue) {
+                std.time.sleep(d.sleep_ns);
                 continue;
             }
+            // Schedule the next slot from now, so the rate does not drift.
+            next_ns = now_ns + period_ns;
         }
         const queue = shared.queue_names[index % shared.queue_names.len];
         var out = broker_mod.Enqueued{};
-        shared.broker.enqueue(shared.opts.workload.kindName(), shared.args_json, .{ .queue = queue }, &out) catch {
+        broker.enqueue(shared.opts.workload.kindName(), shared.args_json, .{ .queue = queue }, &out) catch {
             _ = shared.producer_errors.fetchAdd(1, .seq_cst);
             std.time.sleep(10 * std.time.ns_per_ms);
             continue;
@@ -461,12 +675,32 @@ pub fn run(alloc: std.mem.Allocator, argv: []const []const u8) !u8 {
     const sup = @import("../runtime/supervisor.zig");
     var app = sup.App.init(alloc);
     defer app.deinit();
-    const br = app.openBrokerPublic() catch |e| {
+
+    // One connection per worker, plus one for the producers. A bench that
+    // shares one connection between them measures the connection, not the
+    // system: the producers are an order of magnitude cheaper per operation
+    // than a claim, so they take the connection away from the workers and
+    // the reported numbers collapse.
+    const worker_conns = try alloc.alloc(broker_mod.Broker, opts.workers);
+    defer alloc.free(worker_conns);
+    for (worker_conns) |*c| {
+        c.* = app.openBrokerPublic() catch |e| {
+            try stdout.print("bench: cannot open backend ({s}); set BEANLINE_DATABASE_URL or BEANLINE_REDIS_URL\n", .{@errorName(e)});
+            return 1;
+        };
+        errdefer c.deinit();
+    }
+    var producer_conn = app.openBrokerPublic() catch |e| {
         try stdout.print("bench: cannot open backend ({s}); set BEANLINE_DATABASE_URL or BEANLINE_REDIS_URL\n", .{@errorName(e)});
         return 1;
     };
-    defer br.deinit();
-    return runWithBroker(alloc, argv, br);
+    defer producer_conn.deinit();
+
+    const conns = Connections{
+        .workers = worker_conns,
+        .producers = &.{producer_conn},
+    };
+    return runWithConnections(alloc, argv, conns);
 }
 
 fn printPlan(stdout: anytype, opts: Options) !void {
@@ -482,11 +716,24 @@ fn printPlan(stdout: anytype, opts: Options) !void {
     );
 }
 
+/// The number of jobs waiting across the bench's queues. Best effort: a
+/// depth query that fails must not fail the run.
+fn queueDepth(br: broker_mod.Broker, queues: []const []const u8) u64 {
+    var total: u64 = 0;
+    for (queues) |q| {
+        var d = broker_mod.Depth{};
+        br.depth(q, &d) catch continue;
+        total += d.available + d.scheduled + d.running;
+    }
+    return total;
+}
+
 /// Run the workload and collect the measurements. No printing: the caller
 /// renders the result. This is the piece the tests drive.
-pub fn execute(alloc: std.mem.Allocator, opts_in: Options, br: broker_mod.Broker) !Result {
+pub fn execute(alloc: std.mem.Allocator, opts_in: Options, conns: Connections) !Result {
     var opts = opts_in;
-    opts.backend_label = br.capabilities().named_backend;
+    if (conns.workers.len == 0 and conns.producers.len == 0) return error.NoConnections;
+    opts.backend_label = conns.worker(0).capabilities().named_backend;
 
     const queue_names = try alloc.alloc([]const u8, opts.queues);
     defer {
@@ -505,11 +752,15 @@ pub fn execute(alloc: std.mem.Allocator, opts_in: Options, br: broker_mod.Broker
     const args_json = try buildArgsJson(alloc, opts.payload_bytes);
     defer alloc.free(args_json);
 
+    var reg = try setupRegistry(alloc);
+    defer reg.deinit();
+
     opts.producers = opts.workers;
     var shared = Shared{
         .alloc = alloc,
         .opts = opts,
-        .broker = br,
+        .conns = conns,
+        .reg = &reg,
         .states = states,
         .queue_names = queue_names,
         .args_json = args_json,
@@ -524,10 +775,17 @@ pub fn execute(alloc: std.mem.Allocator, opts_in: Options, br: broker_mod.Broker
     for (producers, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, producerThread, .{ &shared, @as(u16, @intCast(i)) });
 
     if (opts.warmup_ms > 0) std.time.sleep(@intCast(@min(opts.warmup_ms, 60_000) * std.time.ns_per_ms));
+
+    // The queue depth at the start and end of the measurement window says
+    // whether the run was steady state or saturating. Without it a reader
+    // cannot tell a healthy run from one where the workers never caught up.
+    const depth_start = queueDepth(shared.conns.worker(0), queue_names);
+    var depth_end: u64 = 0;
     measure.store(true, .seq_cst);
     const start = std.time.milliTimestamp();
     std.time.sleep(@intCast(opts.duration_ms * std.time.ns_per_ms));
     const elapsed = std.time.milliTimestamp() - start;
+    depth_end = queueDepth(shared.conns.worker(0), queue_names);
     shared.stop.store(true, .seq_cst);
     for (threads) |t| t.join();
     for (producers) |t| t.join();
@@ -540,6 +798,8 @@ pub fn execute(alloc: std.mem.Allocator, opts_in: Options, br: broker_mod.Broker
         .elapsed_ms = elapsed,
         .enqueued = shared.enqueued.load(.seq_cst),
         .errors = shared.producer_errors.load(.seq_cst),
+        .depth_start = depth_start,
+        .depth_end = depth_end,
     };
     for (states) |*s| {
         result.claimed += s.claimed;
@@ -557,9 +817,9 @@ pub fn execute(alloc: std.mem.Allocator, opts_in: Options, br: broker_mod.Broker
     return result;
 }
 
-/// Run the bench against an already-open broker. Exposed so the harness can
+/// Run the bench against already-open connections. Exposed so the harness can
 /// be exercised against a mock broker in tests.
-pub fn runWithBroker(alloc: std.mem.Allocator, argv: []const []const u8, br: broker_mod.Broker) !u8 {
+pub fn runWithConnections(alloc: std.mem.Allocator, argv: []const []const u8, conns: Connections) !u8 {
     const stdout = std.io.getStdOut().writer();
     var opts = parseArgs(argv) catch |e| {
         try stdout.print("beanline bench: {s}\n\n{s}", .{ @errorName(e), usage });
@@ -580,8 +840,8 @@ pub fn runWithBroker(alloc: std.mem.Allocator, argv: []const []const u8, br: bro
         return 0;
     }
 
-    opts.backend_label = br.capabilities().named_backend;
-    const result = try execute(alloc, opts, br);
+    opts.backend_label = conns.worker(0).capabilities().named_backend;
+    const result = try execute(alloc, opts, conns);
     var report_result = result;
     defer {
         report_result.claim_latency.deinit(alloc);
@@ -604,6 +864,7 @@ pub fn runWithBroker(alloc: std.mem.Allocator, argv: []const []const u8, br: bro
             \\failed (retryable) {d}
             \\failed (permanent) {d}
             \\errors             {d}
+            \\queue depth        {d} -> {d}
             \\
             \\claim  p50/p99     {d} / {d} ms
             \\run    p50/p99     {d} / {d} ms
@@ -616,7 +877,8 @@ pub fn runWithBroker(alloc: std.mem.Allocator, argv: []const []const u8, br: bro
             result.elapsed_ms,                                    result.enqueued,
             result.claimed,                                       result.completed,
             result.failed_retryable,                              result.failed_permanent,
-            result.errors,                                        @divTrunc(result.claim_latency.percentile(50), 1000),
+            result.errors,                                        result.depth_start,
+            result.depth_end,                                     @divTrunc(result.claim_latency.percentile(50), 1000),
             @divTrunc(result.claim_latency.percentile(99), 1000), @divTrunc(result.duration.percentile(50), 1000),
             @divTrunc(result.duration.percentile(99), 1000),      @divTrunc(result.e2e.percentile(50), 1000),
             @divTrunc(result.e2e.percentile(99), 1000),           result.throughput(),
@@ -799,8 +1061,14 @@ const MockBroker = struct {
     pending: std.ArrayListUnmanaged(broker_mod.Claimed) = .{},
     next_id: i64 = 1,
     completed: u64 = 0,
+    /// How many jobs the producers handed to the broker.
+    enqueued: u64 = 0,
 
-    fn enqueue(_: *anyopaque, _: []const u8, _: []const u8, _: broker_mod.EnqueueOptions, out: *broker_mod.Enqueued) anyerror!void {
+    fn enqueue(ctx: *anyopaque, _: []const u8, _: []const u8, _: broker_mod.EnqueueOptions, out: *broker_mod.Enqueued) anyerror!void {
+        const self: *MockBroker = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.enqueued += 1;
         out.* = .{ .id = 1 };
     }
 
@@ -869,13 +1137,16 @@ test "bench loop runs end to end against a mock broker" {
     var mock = MockBroker{ .pending = .{} };
     defer mock.pending.deinit(alloc);
 
-    // Seed a few jobs for the workers to claim and finish.
+    // Seed a few jobs for the workers to claim and finish. The payload has to
+    // fit the bench kind's schema: the bench decodes the payload into the
+    // kind's own argument type, so an empty object would be rejected as a
+    // permanent bad payload instead of running.
     for (0..8) |i| {
         try mock.pending.append(alloc, .{
             .id = @intCast(i + 1),
             .queue = "bench0",
             .kind = "bench.noop",
-            .args_json = "{}",
+            .args_json = "{\"to\":\"a\",\"subject\":\"s\"}",
             .attempts = 1,
             .max_attempts = 25,
             .lease_epoch = 1,
@@ -893,7 +1164,8 @@ test "bench loop runs end to end against a mock broker" {
     opts.workers = 2;
 
     const br = broker_mod.Broker{ .ptr = &mock, .vtable = &MockBroker.vt };
-    var result = try execute(alloc, opts, br);
+    const conns = Connections{ .workers = &.{br}, .producers = &.{br} };
+    var result = try execute(alloc, opts, conns);
     defer {
         result.claim_latency.deinit(alloc);
         result.duration.deinit(alloc);
@@ -902,4 +1174,70 @@ test "bench loop runs end to end against a mock broker" {
     try std.testing.expectEqual(@as(u64, 8), mock.completed);
     try std.testing.expectEqual(@as(u64, 8), result.completed);
     try std.testing.expect(result.claimed >= 8);
+}
+
+test "rate decision waits for the next slot" {
+    // Not due yet: sleep, do not enqueue.
+    const early = rateDecision(1_000, 2_000);
+    try std.testing.expect(!early.enqueue);
+    try std.testing.expectEqual(@as(u64, 1_000), early.sleep_ns);
+
+    // Exactly due: enqueue.
+    const due = rateDecision(2_000, 2_000);
+    try std.testing.expect(due.enqueue);
+    try std.testing.expectEqual(@as(u64, 0), due.sleep_ns);
+
+    // Overdue: enqueue, and the caller reschedules from now.
+    const late = rateDecision(5_000, 2_000);
+    try std.testing.expect(late.enqueue);
+
+    // The sleep is capped so a producer still notices the stop flag.
+    const far = rateDecision(0, 10 * std.time.ns_per_s);
+    try std.testing.expect(!far.enqueue);
+    try std.testing.expectEqual(@as(u64, 20 * std.time.ns_per_ms), far.sleep_ns);
+}
+
+test "rate period divides the target rate across the producers" {
+    // 50/s across one producer: one enqueue every 20 ms.
+    try std.testing.expectEqual(@as(i128, 20 * std.time.ns_per_ms), ratePeriodNs(50, 1));
+    // 50/s across two producers: one enqueue every 40 ms each.
+    try std.testing.expectEqual(@as(i128, 40 * std.time.ns_per_ms), ratePeriodNs(50, 2));
+    // No rate means no pacing.
+    try std.testing.expectEqual(@as(i128, 0), ratePeriodNs(0, 4));
+    // A rate below the producer count still gives every producer a slot.
+    try std.testing.expect(ratePeriodNs(1, 8) > 0);
+}
+
+test "bench producer honours the rate limit" {
+    const alloc = std.testing.allocator;
+    var mock = MockBroker{ .pending = .{} };
+    defer mock.pending.deinit(alloc);
+
+    const argv = [_][]const u8{
+        "beanline", "bench", "--workload", "noop", "--duration", "1", "--warmup", "0", "--workers", "1", "--rate", "50",
+    };
+    var opts = try parseArgs(&argv);
+    opts.duration_ms = 600;
+    opts.warmup_ms = 0;
+    opts.workers = 1;
+
+    const br = broker_mod.Broker{ .ptr = &mock, .vtable = &MockBroker.vt };
+    const conns = Connections{ .workers = &.{br}, .producers = &.{br} };
+    var result = try execute(alloc, opts, conns);
+    defer {
+        result.claim_latency.deinit(alloc);
+        result.duration.deinit(alloc);
+        result.e2e.deinit(alloc);
+    }
+
+    // The rate limiter used to advance its deadline faster than the clock,
+    // so it never became due and the producer never enqueued anything. A
+    // run that silently produced zero jobs is the worst failure mode a
+    // measurement tool can have.
+    try std.testing.expect(mock.enqueued > 0);
+    try std.testing.expectEqual(@as(u64, mock.enqueued), result.enqueued);
+
+    // 50/s for 0.6 s is about 30 jobs. The bound is loose enough for a
+    // loaded machine but tight enough to catch a run that ignored the limit.
+    try std.testing.expect(mock.enqueued < 300);
 }
