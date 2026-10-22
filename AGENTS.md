@@ -3,9 +3,10 @@
 Zig 0.14.1 job queue (Postgres/Redis broker, cron scheduler, dashboard). Tests
 live inline in `src/`; `zig build test` = 146 unit + fuzz-target tests
 (`tests/fuzz/all.zig`).
-Shared contract suite (tests/contract/all.zig): 60 cases run identically against
-both backends; `zig build test-contract` (needs BEANLINE_TEST_DSN /
-BEANLINE_TEST_REDIS_URL).
+Shared contract suite (tests/contract/all.zig): 62 cases run identically against
+both backends, 70 per backend with the divergence probes; six of the cases
+drive the runtime rather than the broker; `zig build test-contract` (needs
+BEANLINE_TEST_DSN / BEANLINE_TEST_REDIS_URL).
 
 ## Kind API (changed in 0.8.0)
 

@@ -38,7 +38,7 @@ const Mock = struct {
     fn finishCb(_: *anyopaque, _: []const u8, _: i64, _: u64) anyerror!void {
         return error.Unsupported;
     }
-    fn failCb(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: bool, _: i64, _: *broker_mod.FailOutcome) anyerror!void {
+    fn failCb(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: broker_mod.Failure, _: *broker_mod.FailOutcome) anyerror!void {
         return error.Unsupported;
     }
     fn cancelCb(_: *anyopaque, _: []const u8, _: i64, _: ?u64) anyerror!void {

@@ -27,7 +27,11 @@ for _, id in ipairs(expired) do
       local exhausted = (maxl > 0 and new_losses >= maxl)
       redis.call('HINCRBY', prefix .. ':depth', 'running', -1)
       if attempts >= maxa or exhausted then
-        redis.call('HSET', jk, 'status', 'dead', 'lease_losses', tostring(new_losses))
+        -- The lease-loss bound is what killed it, so the job's handler kept
+        -- killing its worker. Otherwise the attempt budget ran out.
+        local reason = 'attempts_exhausted'
+        if exhausted then reason = 'crash_loop' end
+        redis.call('HSET', jk, 'status', 'dead', 'lease_losses', tostring(new_losses), 'dead_reason', reason)
         redis.call('HINCRBY', prefix .. ':depth', 'dead', 1)
         local uniq = redis.call('HGET', jk, 'unique')
         if uniq and uniq ~= '' then
@@ -36,7 +40,7 @@ for _, id in ipairs(expired) do
         end
       else
         redis.call('HINCRBY', jk, 'attempts', -1)
-        redis.call('HSET', jk, 'status', 'available', 'lease_losses', tostring(new_losses))
+        redis.call('HSET', jk, 'status', 'available', 'lease_losses', tostring(new_losses), 'dead_reason', '')
         redis.call('LPUSH', prefix .. ':ready:' .. redis.call('HGET', jk, 'priority'), id)
         redis.call('HINCRBY', prefix .. ':depth', 'available', 1)
       end

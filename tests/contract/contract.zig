@@ -124,7 +124,7 @@ fn case_claim_increments_attempts(f: *Fixture) !void {
     try std.testing.expectEqual(@as(usize, 1), c1.len);
     try std.testing.expectEqual(@as(u32, 1), c1[0].attempts);
     // fail retryable to return to available, then re-claim
-    const fo = try f.fail(enq.id, c1[0].lease_epoch, "E", true, nowMs() - 1000);
+    const fo = try f.fail(enq.id, c1[0].lease_epoch, "E", .{ .retry = nowMs() - 1000 });
     try std.testing.expectEqual(broker.Status.available, fo.status);
     const c2 = try f.claim(1);
     try std.testing.expectEqual(@as(usize, 1), c2.len);
@@ -172,7 +172,7 @@ fn case_finish_twice_rejected(f: *Fixture) !void {
 fn case_fail_retryable_returns_available(f: *Fixture) !void {
     const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 3 });
     const c = try f.claim(1);
-    const fo = try f.fail(enq.id, c[0].lease_epoch, "E", true, nowMs() - 1000);
+    const fo = try f.fail(enq.id, c[0].lease_epoch, "E", .{ .retry = nowMs() - 1000 });
     try std.testing.expectEqual(broker.Status.available, fo.status);
     const d = try f.depth();
     try std.testing.expectEqual(@as(u64, 1), d.available);
@@ -182,7 +182,7 @@ fn case_fail_retryable_returns_available(f: *Fixture) !void {
 fn case_fail_retryable_at_max_goes_dead(f: *Fixture) !void {
     const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 1 });
     const c = try f.claim(1);
-    const fo = try f.fail(enq.id, c[0].lease_epoch, "E", true, nowMs() - 1000);
+    const fo = try f.fail(enq.id, c[0].lease_epoch, "E", .{ .retry = nowMs() - 1000 });
     try std.testing.expectEqual(broker.Status.dead, fo.status);
     const d = try f.depth();
     try std.testing.expectEqual(@as(u64, 1), d.dead);
@@ -191,7 +191,7 @@ fn case_fail_retryable_at_max_goes_dead(f: *Fixture) !void {
 fn case_fail_nonretryable_goes_dead(f: *Fixture) !void {
     const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 3 });
     const c = try f.claim(1);
-    const fo = try f.fail(enq.id, c[0].lease_epoch, "E", false, 0);
+    const fo = try f.fail(enq.id, c[0].lease_epoch, "E", .{ .non_retryable = {} });
     try std.testing.expectEqual(broker.Status.dead, fo.status);
     const d = try f.depth();
     try std.testing.expectEqual(@as(u64, 1), d.dead);
@@ -200,7 +200,7 @@ fn case_fail_nonretryable_goes_dead(f: *Fixture) !void {
 fn case_fail_stale_epoch_rejected(f: *Fixture) !void {
     const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue });
     const c = try f.claim(1);
-    try std.testing.expectError(error.StaleLease, f.fail(enq.id, c[0].lease_epoch + 1, "E", true, nowMs() - 1000));
+    try std.testing.expectError(error.StaleLease, f.fail(enq.id, c[0].lease_epoch + 1, "E", .{ .retry = nowMs() - 1000 }));
 }
 
 fn case_cancel_available(f: *Fixture) !void {
@@ -247,7 +247,7 @@ fn case_discard_available(f: *Fixture) !void {
 fn case_operator_retry_dead(f: *Fixture) !void {
     const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 1 });
     const c = try f.claim(1);
-    _ = try f.fail(enq.id, c[0].lease_epoch, "E", false, 0);
+    _ = try f.fail(enq.id, c[0].lease_epoch, "E", .{ .non_retryable = {} });
     var d = try f.depth();
     try std.testing.expectEqual(@as(u64, 1), d.dead);
     try f.retry(enq.id);
@@ -503,7 +503,7 @@ fn case_depth_tracks_states(f: *Fixture) !void {
     // dead
     const e4 = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 1 });
     const c3 = try f.claim(1);
-    _ = try f.fail(e4.id, c3[0].lease_epoch, "E", false, 0);
+    _ = try f.fail(e4.id, c3[0].lease_epoch, "E", .{ .non_retryable = {} });
     // cancelled
     const e5 = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue });
     try f.cancel(e5.id, null);
@@ -589,7 +589,7 @@ fn case_event_trail(f: *Fixture) !void {
 fn case_event_trail_dead(f: *Fixture) !void {
     const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 1 });
     const c = try f.claim(1);
-    _ = try f.fail(enq.id, c[0].lease_epoch, "E", false, 0);
+    _ = try f.fail(enq.id, c[0].lease_epoch, "E", .{ .non_retryable = {} });
     const evs = try f.events(enq.id);
     var has_dead = false;
     for (evs) |e| {
@@ -628,7 +628,7 @@ fn case_context_round_trip(f: *Fixture) !void {
 fn case_retry_not_claimable_until_run_at(f: *Fixture) !void {
     const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 3 });
     const c = try f.claim(1);
-    _ = try f.fail(enq.id, c[0].lease_epoch, "E", true, nowMs() + 5000);
+    _ = try f.fail(enq.id, c[0].lease_epoch, "E", .{ .retry = nowMs() + 5000 });
     const claimed = try f.claim(1);
     try std.testing.expectEqual(@as(usize, 0), claimed.len);
 }
@@ -636,7 +636,7 @@ fn case_retry_not_claimable_until_run_at(f: *Fixture) !void {
 fn case_retry_claimable_after_run_at(f: *Fixture) !void {
     const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 3 });
     const c = try f.claim(1);
-    _ = try f.fail(enq.id, c[0].lease_epoch, "E", true, nowMs() - 1000);
+    _ = try f.fail(enq.id, c[0].lease_epoch, "E", .{ .retry = nowMs() - 1000 });
     const claimed = try f.claim(1);
     try std.testing.expectEqual(@as(usize, 1), claimed.len);
     try std.testing.expectEqual(enq.id, claimed[0].id);
@@ -693,7 +693,7 @@ fn case_capabilities_transactional_enqueue(f: *Fixture) !void {
 fn probe_unique_released_after_dead(f: *Fixture) !void {
     const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .unique_key = "ud-1" });
     const c = try f.claim(1);
-    _ = try f.fail(enq.id, c[0].lease_epoch, "E", false, 0);
+    _ = try f.fail(enq.id, c[0].lease_epoch, "E", .{ .non_retryable = {} });
     const e2 = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .unique_key = "ud-1" });
     // After fix: both postgres and redis release the guard when a job goes
     // dead (postgres via the 'dead'-excluding unique index, redis via the
@@ -1056,6 +1056,85 @@ fn case_runtime_tighter_budget_wins(f: *Fixture) !void {
     try std.testing.expectEqual(@as(u32, 2), row.attempts);
 }
 
+/// A dead job records why it died, so a dead-letter queue can be aggregated
+/// by cause instead of by reading event JSON and joining to the job row.
+fn case_dead_reason_records_the_cause(f: *Fixture) !void {
+    const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 3 });
+    const c = try f.claim(1);
+    try std.testing.expectEqual(@as(usize, 1), c.len);
+
+    // A permanent error kills the job on the first attempt.
+    const fo = try f.fail(enq.id, c[0].lease_epoch, "AddressInvalid", .{ .non_retryable = {} });
+    try std.testing.expectEqual(broker.Status.dead, fo.status);
+    try std.testing.expectEqual(broker.DeadReason.non_retryable, fo.dead_reason.?);
+
+    const row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.dead, row.status);
+    try std.testing.expectEqual(broker.DeadReason.non_retryable, row.dead_reason.?);
+
+    // The event trail and the row agree, so a reader does not have to join
+    // two tables to find out why the job died. The match is loose because
+    // Postgres stores the event data as JSONB and normalizes its whitespace.
+    const evs = try f.events(enq.id);
+    var found = false;
+    for (evs) |e| {
+        if (!std.mem.eql(u8, e.event_type, "dead")) continue;
+        if (std.mem.indexOf(u8, e.data_json, "reason") != null and
+            std.mem.indexOf(u8, e.data_json, "non_retryable") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+/// A retryable error that runs out of budget dies of the budget, not of the
+/// error. The two are different causes and the row has to tell them apart.
+fn case_dead_reason_distinguishes_budget_from_error(f: *Fixture) !void {
+    const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 1 });
+    const c = try f.claim(1);
+    try std.testing.expectEqual(@as(usize, 1), c.len);
+
+    // The error is worth retrying, but the job has one attempt and it is
+    // spent, so the broker dead-letters it.
+    const fo = try f.fail(enq.id, c[0].lease_epoch, "Timeout", .{ .retry = nowMs() - 1000 });
+    try std.testing.expectEqual(broker.Status.dead, fo.status);
+    try std.testing.expectEqual(broker.DeadReason.attempts_exhausted, fo.dead_reason.?);
+
+    const row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.DeadReason.attempts_exhausted, row.dead_reason.?);
+}
+
+/// An operator throwing a job away says so, and an operator re-queuing a
+/// dead job clears the reason: the job is live again.
+fn case_dead_reason_covers_operator_actions(f: *Fixture) !void {
+    const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .max_attempts = 1 });
+    const c = try f.claim(1);
+    try std.testing.expectEqual(@as(usize, 1), c.len);
+    _ = try f.fail(enq.id, c[0].lease_epoch, "Timeout", .{ .non_retryable = {} });
+
+    var row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.DeadReason.non_retryable, row.dead_reason.?);
+
+    // Re-queue it: the reason is cleared, because the job is live again.
+    try f.retry(enq.id);
+    row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.available, row.status);
+    try std.testing.expect(row.dead_reason == null);
+
+    // Now throw a live job away.
+    try f.discard(enq.id);
+    row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.discarded, row.status);
+    try std.testing.expectEqual(broker.DeadReason.discarded_by_operator, row.dead_reason.?);
+}
+
+/// A cancelled job says so.
+fn case_dead_reason_covers_cancellation(f: *Fixture) !void {
+    const enq = try f.enqueue("ct.kind", "{}", .{ .queue = f.queue, .run_at_ms = 0 });
+    try f.cancel(enq.id, null);
+    const row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.cancelled, row.status);
+    try std.testing.expectEqual(broker.DeadReason.cancelled, row.dead_reason.?);
+}
+
 pub const contract_cases = [_]harness.Case{
     .{ .name = "enqueue-immediately-available", .queue = "enqueue-now", .run = case_enqueue_now_available },
     .{ .name = "enqueue-future-is-scheduled", .queue = "enqueue-future", .run = case_enqueue_future_scheduled },
@@ -1115,6 +1194,10 @@ pub const contract_cases = [_]harness.Case{
     .{ .name = "runtime-retryable-error-is-retried", .queue = "rt-retry", .run = case_runtime_retryable_error_is_retried },
     .{ .name = "runtime-kind-budget-bounds-the-row", .queue = "rt-budget", .run = case_runtime_kind_budget_bounds_the_row },
     .{ .name = "runtime-tighter-budget-wins", .queue = "rt-tight", .run = case_runtime_tighter_budget_wins },
+    .{ .name = "dead-reason-records-the-cause", .queue = "reason-cause", .run = case_dead_reason_records_the_cause },
+    .{ .name = "dead-reason-distinguishes-budget-from-error", .queue = "reason-budget", .run = case_dead_reason_distinguishes_budget_from_error },
+    .{ .name = "dead-reason-covers-operator-actions", .queue = "reason-ops", .run = case_dead_reason_covers_operator_actions },
+    .{ .name = "dead-reason-covers-cancellation", .queue = "reason-cancel", .run = case_dead_reason_covers_cancellation },
 };
 
 pub const divergence_probes = [_]harness.Probe{

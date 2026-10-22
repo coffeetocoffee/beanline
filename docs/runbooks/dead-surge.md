@@ -22,15 +22,32 @@
    curl -s -H "Authorization: Bearer $KEY" 127.0.0.1:9484/api/jobs/12345
    ```
 
-3. **Which reason?** There is no `dead_reason` field. The event trail carries
-   the reason:
+3. **Which reason?** The job row carries a `dead_reason`, and so does the
+   event trail:
 
-   | Last event | Meaning |
+   ```sh
+   curl -s -H "Authorization: Bearer $KEY" 127.0.0.1:9484/api/jobs/12345
+   # {"id":12345, ..., "dead_reason":"non_retryable"}
+   ```
+
+   | `dead_reason` | Meaning |
    |---|---|
-   | `dead` after `attempt_failed` | The handler returned an error. The event carries `error` and `retryable`. |
-   | `dead` after `reaped` | The job lost `max_lease_losses` leases: the handler kept killing its worker. |
-   | `dead` after `claimed` | The job spent its `max_attempts` budget. |
-   | `discarded_by_operator` | A human threw it away |
+   | `non_retryable` | The handler returned an error the kind classified as permanent. |
+   | `attempts_exhausted` | The error was worth retrying, but the attempt budget ran out. |
+   | `crash_loop` | The job lost `max_lease_losses` leases: the handler kept killing its worker. |
+   | `discarded_by_operator` | A human threw it away. |
+   | `cancelled` | The job was cancelled. |
+
+   The reason is null for a job that is still live, and null for jobs that
+   were already dead before the column existed: for those, read the event
+   trail instead.
+
+   To count them across a queue:
+
+   ```sql
+   SELECT dead_reason, count(*) FROM beanline_jobs
+   WHERE queue = 'mailers' AND status = 'dead' GROUP BY dead_reason;
+   ```
 
 ## Likely causes and actions
 

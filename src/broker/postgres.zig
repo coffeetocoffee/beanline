@@ -86,18 +86,22 @@ const SQL_FAIL =
     \\  status = CASE WHEN $3::bool AND attempts < max_attempts THEN 'available' ELSE 'dead' END,
     \\  run_at = CASE WHEN $3::bool AND attempts < max_attempts
     \\                THEN to_timestamp($4::bigint::double precision / 1000.0) ELSE run_at END,
+    \\  dead_reason = CASE WHEN $3::bool AND attempts < max_attempts THEN NULL
+    \\                     WHEN $3::bool THEN 'attempts_exhausted'
+    \\                     ELSE $5::text END,
     \\  lock_expires_at = NULL
     \\WHERE id = $1 AND lease_epoch = $2 AND status = 'running'
-    \\RETURNING status, attempts, (extract(epoch from run_at) * 1000)::bigint
+    \\RETURNING status, attempts, (extract(epoch from run_at) * 1000)::bigint, dead_reason
 ;
 
 const SQL_CANCEL_PENDING =
-    \\UPDATE beanline_jobs SET status = 'cancelled', finished_at = now()
+    \\UPDATE beanline_jobs SET status = 'cancelled', finished_at = now(), dead_reason = 'cancelled'
     \\WHERE id = $1 AND status IN ('available','scheduled')
 ;
 
 const SQL_CANCEL_RUNNING =
-    \\UPDATE beanline_jobs SET status = 'cancelled', finished_at = now(), lock_expires_at = NULL
+    \\UPDATE beanline_jobs SET status = 'cancelled', finished_at = now(), lock_expires_at = NULL,
+    \\  dead_reason = 'cancelled'
     \\WHERE id = $1 AND lease_epoch = $2 AND status = 'running'
 ;
 
@@ -138,13 +142,16 @@ const SQL_REAP =
     \\         THEN 'dead' ELSE 'available' END AS new_status,
     \\    CASE WHEN attempts >= max_attempts
     \\           OR (max_lease_losses > 0 AND lease_losses + 1 >= max_lease_losses)
-    \\         THEN attempts ELSE greatest(attempts - 1, 0) END AS new_attempts
+    \\         THEN attempts ELSE greatest(attempts - 1, 0) END AS new_attempts,
+    \\    CASE WHEN max_lease_losses > 0 AND lease_losses + 1 >= max_lease_losses
+    \\         THEN 'crash_loop' ELSE 'attempts_exhausted' END AS new_reason
     \\  FROM exp
     \\)
     \\UPDATE beanline_jobs j SET
     \\  status = u.new_status,
     \\  attempts = u.new_attempts,
     \\  lease_losses = u.lease_losses_after,
+    \\  dead_reason = CASE WHEN u.new_status = 'dead' THEN u.new_reason ELSE NULL END,
     \\  lock_expires_at = NULL
     \\FROM upd u WHERE j.id = u.id
     \\RETURNING j.id, j.status, u.attempts_before, j.lease_losses
@@ -318,17 +325,32 @@ const Pg = struct {
         try self.c.execSimple("COMMIT");
     }
 
-    fn failImpl(self: *Pg, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, retryable: bool, retry_at_ms: i64, out: *b.FailOutcome) !void {
+    fn failImpl(self: *Pg, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, failure: b.Failure, out: *b.FailOutcome) !void {
         _ = queue;
         var pbuf: [3][24]u8 = undefined;
         const idstr = try std.fmt.bufPrint(&pbuf[0], "{d}", .{id});
         const epstr = try std.fmt.bufPrint(&pbuf[1], "{d}", .{lease_epoch});
+        const retry_at_ms: i64 = switch (failure) {
+            .retry => |t| t,
+            else => 0,
+        };
         const rstr = try std.fmt.bufPrint(&pbuf[2], "{d}", .{retry_at_ms});
-        const retry_s: []const u8 = if (retryable) "true" else "false";
+        // The SQL decides the outcome. A retryable error goes back on the
+        // queue unless the job's own budget is spent, in which case it dies
+        // with attempts_exhausted. Anything else dies with the reason the
+        // caller gave.
+        const retry_s: []const u8 = switch (failure) {
+            .retry => "true",
+            else => "false",
+        };
+        const reason_s: []const u8 = switch (failure) {
+            .retry, .attempts_exhausted => "attempts_exhausted",
+            .non_retryable => "non_retryable",
+        };
 
         try self.c.execSimple("BEGIN");
         errdefer self.rollback();
-        var rows = try self.c.query(SQL_FAIL, &.{ idstr, epstr, retry_s, rstr });
+        var rows = try self.c.query(SQL_FAIL, &.{ idstr, epstr, retry_s, rstr, reason_s });
         defer rows.deinit();
         if (rows.rows.len == 0) {
             self.rollback();
@@ -338,11 +360,29 @@ const Pg = struct {
         out.status = b.Status.fromSql(status_s) orelse return error.ProtocolViolation;
         out.attempts = try Pg.intCell(u32, rows.rows[0], 1);
         out.retry_at_ms = try Pg.intCell(i64, rows.rows[0], 2);
+        out.dead_reason = if (rows.rows[0][3]) |r|
+            (b.DeadReason.fromSql(r) orelse return error.ProtocolViolation)
+        else
+            null;
 
         const quoted_err = try self.quoteJson(err_name);
         defer self.alloc.free(quoted_err);
-        var evbuf: [320]u8 = undefined;
-        const evdata = try std.fmt.bufPrint(&evbuf, "{{\"error\":{s},\"retryable\":{s},\"next_run_at\":{d}}}", .{ quoted_err, retry_s, retry_at_ms });
+        var evbuf: [384]u8 = undefined;
+        var reason_buf: [64]u8 = undefined;
+        // "retryable" says whether the job is being tried again, and "reason"
+        // says why it died when it did. Together they replace the guesswork a
+        // reader would otherwise do from the event sequence.
+        const retrying = out.status == .available;
+        const reason_json = if (out.dead_reason) |r|
+            try std.fmt.bufPrint(&reason_buf, "\"{s}\"", .{r.toSql()})
+        else
+            "null";
+        const evdata = try std.fmt.bufPrint(&evbuf, "{{\"error\":{s},\"retryable\":{s},\"reason\":{s},\"next_run_at\":{d}}}", .{
+            quoted_err,
+            if (retrying) "true" else "false",
+            reason_json,
+            if (retrying) retry_at_ms else 0,
+        });
         const ev_type: []const u8 = if (out.status == .dead) "dead" else "attempt_failed";
         try self.insertEvent(id, ev_type, evdata);
         try self.c.execSimple("COMMIT");
@@ -472,11 +512,11 @@ fn finishCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64) anyer
     try self.finishImpl(queue, id, lease_epoch);
 }
 
-fn failCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, retryable: bool, retry_at_ms: i64, out: *b.FailOutcome) anyerror!void {
+fn failCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, failure: b.Failure, out: *b.FailOutcome) anyerror!void {
     const self: *Pg = @ptrCast(@alignCast(ctx));
     self.mu.lock();
     defer self.mu.unlock();
-    try self.failImpl(queue, id, lease_epoch, err_name, retryable, retry_at_ms, out);
+    try self.failImpl(queue, id, lease_epoch, err_name, failure, out);
 }
 
 fn cancelCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: ?u64) anyerror!void {
@@ -527,7 +567,8 @@ const SQL_LIST_BASE =
     \\       coalesce(worker_id, ''),
     \\       (extract(epoch from inserted_at) * 1000)::bigint,
     \\       coalesce((extract(epoch from started_at) * 1000)::bigint, 0),
-    \\       coalesce((extract(epoch from finished_at) * 1000)::bigint, 0)
+    \\       coalesce((extract(epoch from finished_at) * 1000)::bigint, 0),
+    \\       dead_reason
     \\FROM beanline_jobs
 ;
 
@@ -563,7 +604,7 @@ const SQL_QUEUE_PAUSED = "SELECT paused FROM beanline_queue_state WHERE queue = 
 // the same way, since a retried job does not re-acquire the guard.
 const SQL_RETRY =
     \\UPDATE beanline_jobs j SET status = 'available', run_at = now(),
-    \\  attempts = 0, lease_losses = 0, lock_expires_at = NULL,
+    \\  attempts = 0, lease_losses = 0, lock_expires_at = NULL, dead_reason = NULL,
     \\  unique_key = CASE WHEN EXISTS (
     \\      SELECT 1 FROM beanline_jobs o
     \\      WHERE o.queue = j.queue AND o.kind = j.kind
@@ -576,7 +617,7 @@ const SQL_RETRY =
 
 const SQL_DISCARD =
     \\UPDATE beanline_jobs SET status = 'discarded', finished_at = now(),
-    \\  lock_expires_at = NULL
+    \\  lock_expires_at = NULL, dead_reason = 'discarded_by_operator'
     \\WHERE id = $1 AND queue = $2 AND status IN ('dead','available','scheduled')
 ;
 
@@ -599,6 +640,7 @@ fn rowToJobRow(row: []?[]const u8) !b.JobRow {
         .inserted_ms = try Pg.intCell(i64, row, 13),
         .started_ms = try Pg.intCell(i64, row, 14),
         .finished_ms = try Pg.intCell(i64, row, 15),
+        .dead_reason = if (row[16]) |r| (b.DeadReason.fromSql(r) orelse return error.ProtocolViolation) else null,
     };
 }
 
@@ -698,6 +740,7 @@ fn getJobImpl(self: *Pg, alloc: std.mem.Allocator, id: i64, out: *?b.JobRow) !vo
         .inserted_ms = jr.inserted_ms,
         .started_ms = jr.started_ms,
         .finished_ms = jr.finished_ms,
+        .dead_reason = jr.dead_reason,
     };
 }
 
@@ -1032,14 +1075,14 @@ test "live broker round trip" {
     try std.testing.expectEqual(@as(usize, 1), n2);
 
     var fail_out = b.FailOutcome{};
-    try br.fail("live-test", claimed2[0].id, claimed2[0].lease_epoch, "Timeout", true, 0, &fail_out);
+    try br.fail("live-test", claimed2[0].id, claimed2[0].lease_epoch, "Timeout", .{ .retry = 0 }, &fail_out);
     try std.testing.expectEqual(b.Status.available, fail_out.status);
     try std.testing.expectEqual(@as(u32, 1), fail_out.attempts);
 
     const n3 = try br.claim("live-test", 4, "host:1:boot", 1, &claimed2);
     try std.testing.expectEqual(@as(usize, 1), n3);
     var fail_out2 = b.FailOutcome{};
-    try br.fail("live-test", claimed2[0].id, claimed2[0].lease_epoch, "AddressInvalid", false, 0, &fail_out2);
+    try br.fail("live-test", claimed2[0].id, claimed2[0].lease_epoch, "AddressInvalid", .{ .non_retryable = {} }, &fail_out2);
     try std.testing.expectEqual(b.Status.dead, fail_out2.status);
 
     var enq4 = b.Enqueued{};

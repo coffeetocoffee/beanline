@@ -157,7 +157,7 @@ pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; }
     if (k) qs.push("kind=" + encodeURIComponent(k));
     api("/api/jobs" + (qs.length ? "?" + qs.join("&") : "")).then(function (x) {
       var rows = x.body.jobs.map(function (j) {
-        return "<tr><td>" + j.id + "</td><td>" + esc(j.queue) + "</td><td>" + esc(j.kind) + "</td><td><span class='pill " + j.status + "'>" + j.status + "</span></td><td>" + j.attempts + "/" + j.max_attempts + "</td><td><button data-id='" + j.id + "' class='view'>view</button></td></tr>";
+        return "<tr><td>" + j.id + "</td><td>" + esc(j.queue) + "</td><td>" + esc(j.kind) + "</td><td><span class='pill " + j.status + "'>" + j.status + "</span>" + (j.dead_reason ? " <span class='pill dead'>" + esc(j.dead_reason) + "</span>" : "") + "</td><td>" + j.attempts + "/" + j.max_attempts + "</td><td><button data-id='" + j.id + "' class='view'>view</button></td></tr>";
       }).join("");
       document.getElementById("jobTable").innerHTML = "<table><tr><th>id</th><th>queue</th><th>kind</th><th>status</th><th>attempts</th><th></th></tr>" + rows + "</table>";
       document.querySelectorAll("button.view").forEach(function (b) {
@@ -173,7 +173,8 @@ pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; }
       if (!j.id) { document.getElementById("jobDetail").textContent = "not found"; return; }
       var ev = (j.events || []).map(function (e) { return "<tr><td>" + e.seq + "</td><td>" + esc(e.type) + "</td><td><pre>" + esc(typeof e.data === "string" ? e.data : JSON.stringify(e.data)) + "</pre></td></tr>"; }).join("");
       document.getElementById("jobDetail").innerHTML =
-        "<p><b>#" + j.id + "</b> " + esc(j.kind) + " on <b>" + esc(j.queue) + "</b> <span class='pill " + j.status + "'>" + j.status + "</span></p>" +
+        "<p><b>#" + j.id + "</b> " + esc(j.kind) + " on <b>" + esc(j.queue) + "</b> <span class='pill " + j.status + "'>" + j.status + "</span>" +
+        (j.dead_reason ? " <span class='pill dead'>" + esc(j.dead_reason) + "</span>" : "") + "</p>" +
         "<p>attempts " + j.attempts + "/" + j.max_attempts + " · epoch " + j.lease_epoch + " · worker " + esc(j.worker_id || "—") + "</p>" +
         "<p>args</p><pre>" + esc(typeof j.args === "string" ? j.args : JSON.stringify(j.args, null, 2)) + "</pre>" +
         "<div class='row'><button id='jRetry'>retry</button><button id='jDiscard' class='danger'>discard</button><button id='jCancel' class='ghost'>cancel</button></div>" +

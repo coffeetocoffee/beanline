@@ -52,6 +52,14 @@ simply return nothing until resumed.
 The action endpoints accept an optional JSON body `{"queue": "name"}` when the
 job id alone is ambiguous (Redis mode keys jobs per queue).
 
+Every job row carries a `dead_reason`: why the job stopped without
+completing. It is `null` while the job is live, and one of
+`attempts_exhausted` (the attempt budget ran out), `non_retryable` (the
+handler returned an error the kind classified as permanent), `crash_loop` (the
+job lost too many leases), `discarded_by_operator` or `cancelled` otherwise.
+It is null for jobs that completed, and null for jobs that were already dead
+before the column existed.
+
 ### Enqueue
 
 | Method | Path | Description |

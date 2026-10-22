@@ -227,12 +227,23 @@ const Redis = struct {
         if (!ok) return error.StaleLease;
     }
 
-    fn failImpl(self: *Redis, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, retryable: bool, retry_at_ms: i64, out: *b.FailOutcome) !void {
+    fn failImpl(self: *Redis, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, failure: b.Failure, out: *b.FailOutcome) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const al = arena.allocator();
         const now: i64 = std.time.milliTimestamp();
-        const retry_s: []const u8 = if (retryable) "1" else "0";
+        const retry_at_ms: i64 = switch (failure) {
+            .retry => |t| t,
+            else => 0,
+        };
+        const retry_s: []const u8 = switch (failure) {
+            .retry => "1",
+            else => "0",
+        };
+        const reason_s: []const u8 = switch (failure) {
+            .retry, .attempts_exhausted => "attempts_exhausted",
+            .non_retryable => "non_retryable",
+        };
         const argv = [_][]const u8{
             queue,
             try std.fmt.allocPrint(al, "{d}", .{id}),
@@ -241,17 +252,20 @@ const Redis = struct {
             try std.fmt.allocPrint(al, "{d}", .{retry_at_ms}),
             try std.fmt.allocPrint(al, "{d}", .{now}),
             err_name,
+            reason_s,
         };
         const v = try self.c.eval(al, fail_lua, &.{}, &argv);
         const items = switch (v) {
             .array => |a| a,
             else => return error.StaleLease,
         };
-        if (items.len != 3) return error.StaleLease;
+        if (items.len != 4) return error.StaleLease;
         const status_s = try items[0].asString();
         out.status = b.Status.fromSql(status_s) orelse return error.Protocol;
         out.retry_at_ms = try items[1].asInt();
         out.attempts = @intCast(try items[2].asInt());
+        const reason_s2 = try items[3].asString();
+        out.dead_reason = if (reason_s2.len == 0) null else (b.DeadReason.fromSql(reason_s2) orelse return error.Protocol);
     }
 
     fn cancelImpl(self: *Redis, queue: []const u8, id: i64, lease_epoch: ?u64) !void {
@@ -366,11 +380,11 @@ fn finishCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64) anyer
     try self.finishImpl(queue, id, lease_epoch);
 }
 
-fn failCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, retryable: bool, retry_at_ms: i64, out: *b.FailOutcome) anyerror!void {
+fn failCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, failure: b.Failure, out: *b.FailOutcome) anyerror!void {
     const self: *Redis = @ptrCast(@alignCast(ctx));
     self.mu.lock();
     defer self.mu.unlock();
-    try self.failImpl(queue, id, lease_epoch, err_name, retryable, retry_at_ms, out);
+    try self.failImpl(queue, id, lease_epoch, err_name, failure, out);
 }
 
 fn cancelCb(ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: ?u64) anyerror!void {
@@ -495,6 +509,13 @@ fn rowFromHash(alloc: std.mem.Allocator, qname: []const u8, id: i64, fields: []c
         .inserted_ms = parseI64(hashGet(fields, "inserted_at")),
         .started_ms = parseI64(hashGet(fields, "finished_at")),
         .finished_ms = parseI64(hashGet(fields, "finished_at")),
+        // Jobs that predate the reason field have no dead_reason, and a job
+        // that is still live has it cleared.
+        .dead_reason = blk: {
+            const r = hashGet(fields, "dead_reason") orelse break :blk null;
+            if (r.len == 0) break :blk null;
+            break :blk (b.DeadReason.fromSql(r) orelse return error.Protocol);
+        },
     };
 }
 
@@ -640,7 +661,7 @@ const redis_retry_lua =
     \\local jk = prefix .. ':job:' .. ARGV[2]
     \\local st = redis.call('HGET', jk, 'status')
     \\if st ~= 'dead' and st ~= 'cancelled' then return 0 end
-    \\redis.call('HSET', jk, 'status', 'available', 'run_at', ARGV[3], 'attempts', '0', 'lease_losses', '0')
+    \\redis.call('HSET', jk, 'status', 'available', 'run_at', ARGV[3], 'attempts', '0', 'lease_losses', '0', 'dead_reason', '')
     \\redis.call('DEL', prefix .. ':lease:' .. ARGV[2])
     \\redis.call('ZREM', prefix .. ':expires', ARGV[2])
     \\redis.call('LPUSH', prefix .. ':ready:' .. (redis.call('HGET', jk, 'priority') or '1'), ARGV[2])
@@ -657,7 +678,7 @@ const redis_discard_lua =
     \\local st = redis.call('HGET', jk, 'status')
     \\if not st then return 0 end
     \\if st ~= 'dead' and st ~= 'available' and st ~= 'scheduled' then return 0 end
-    \\redis.call('HSET', jk, 'status', 'discarded', 'finished_at', ARGV[3])
+    \\redis.call('HSET', jk, 'status', 'discarded', 'finished_at', ARGV[3], 'dead_reason', 'discarded_by_operator')
     \\redis.call('LREM', prefix .. ':ready:' .. (redis.call('HGET', jk, 'priority') or '1'), 0, ARGV[2])
     \\redis.call('ZREM', prefix .. ':delayed', ARGV[2])
     \\redis.call('HINCRBY', prefix .. ':depth', st, -1)
@@ -1007,13 +1028,13 @@ test "live redis round trip" {
     try std.testing.expectEqual(@as(usize, 1), try br.claim(q, 4, "host:1:boot", 60000, &claimed2));
 
     var fail_out = b.FailOutcome{};
-    try br.fail(q, claimed2[0].id, claimed2[0].lease_epoch, "Timeout", true, now_ms, &fail_out);
+    try br.fail(q, claimed2[0].id, claimed2[0].lease_epoch, "Timeout", .{ .retry = now_ms }, &fail_out);
     try std.testing.expectEqual(b.Status.available, fail_out.status);
     try std.testing.expectEqual(@as(u32, 1), fail_out.attempts);
 
     try std.testing.expectEqual(@as(usize, 1), try br.claim(q, 4, "host:1:boot", 60000, &claimed2));
     var fail_out2 = b.FailOutcome{};
-    try br.fail(q, claimed2[0].id, claimed2[0].lease_epoch, "AddressInvalid", false, 0, &fail_out2);
+    try br.fail(q, claimed2[0].id, claimed2[0].lease_epoch, "AddressInvalid", .{ .non_retryable = {} }, &fail_out2);
     try std.testing.expectEqual(b.Status.dead, fail_out2.status);
 
     var enq4 = b.Enqueued{};

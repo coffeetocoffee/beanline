@@ -183,7 +183,7 @@ producers, workers, and dashboard tiers.
 
 | Term | Definition |
 |---|---|
-| Job | A typed unit of work: `kind` (handler name), JSON `args`, queue, priority, attempt policy. |
+| Job | A typed unit of work: `kind` (handler name), JSON `args`, queue, priority, attempt policy, `dead_reason` (why it stopped, null while live). |
 | Kind | Registered handler identity; args schema and error/retry policy attach to the kind. |
 | Queue | Named FIFO/priority lane with its own concurrency cap and rate limit. |
 | Lease | Time-bounded exclusive claim held by a worker, identified by `lease_epoch` (the fencing token). |
@@ -739,11 +739,19 @@ comptime-unrolled classifier; `core/job.zig` builds the per-kind runner;
 ### 10.4 Dead letter queue
 
 - Dead jobs keep full error history (events: error, stack, payload, attempt
-  durations). A machine-readable `dead_reason`
-  (`attempts_exhausted | non_retryable | crash_loop | discarded_by_operator`) is
-  not implemented; the event trail carries the reason instead (a `dead` event
-  after `attempt_failed` is a handler error, a `dead` event after `reaped` is
-  the lease-loss bound, and the job row carries `attempts` and `lease_losses`).
+  durations). A machine-readable `dead_reason` is stored on the job row, so a
+  dead-letter queue can be aggregated by cause without reading event JSON:
+  `attempts_exhausted` (the attempt budget ran out), `non_retryable` (the
+  handler returned an error the kind classified as permanent), `crash_loop`
+  (the job lost too many leases), `discarded_by_operator`, and `cancelled`.
+  The column is null while a job is live, and null for jobs that were already
+  dead when the column was added: their cause is not recoverable after the
+  fact, but the event trail still has it.
+- The `dead` event carries the reason too, so the event trail and the row
+  agree: `{"error": ..., "retryable": ..., "reason": ..., "next_run_at": ...}`.
+  `retryable` says whether the job is being tried again, which is what a
+  reader wants to know, rather than whether the error was worth retrying in
+  the abstract.
 - Replay policies: manual (dashboard/CLI), scoped auto-replay
   (`dead.auto_replay_after` with bounded count), and replay-with-edited-args
   (dashboard JSON editor validates against the kind's arg struct before
@@ -1109,15 +1117,23 @@ papering over it.
 
 ## 21. Testing strategy
 
-1. Contract suite (the keystone): one file of ~120 tests written against the
+1. Contract suite (the keystone): one file of shared cases written against the
    `Broker` interface; runs identically against PG and Redis. Covers claim
    atomicity, fencing writes, lease expiry/reap, cancel races, unique-key
    semantics, promote boundaries, batch counters, and the full state machine
-   of 5.3. A backend change that passes in PG and not Redis fails CI, full stop.
+   of 5.3. A backend change that passes in PG and not Redis fails CI, full
+   stop.
 
-   Implemented as `tests/contract/` (56 shared cases + 16 documented
-   divergence probes), executed by `zig build test-contract` and by the CI
-   `contract` job against live Postgres and Redis. The suite also surfaced
+   Six of the cases drive the *runtime* rather than the broker: the real
+   owner, the real pool, the real registry, the real per-kind payload decode
+   and the real per-kind error classification. The broker cases could all
+   pass while the runtime was unable to run a job with a real payload, which
+   is exactly what happened before v0.8.0, so the runtime is covered too.
+
+   Implemented as `tests/contract/` (62 shared cases + 16 documented
+   divergence probes, eight per backend), executed by
+   `zig build test-contract` and by the CI `contract` job against live
+   Postgres and Redis. The suite also surfaced
    the following pre-existing divergences (see §24):
    - PG's `dedup_run_id` conflict path had a parameter-count mismatch
      (`lookup_params` passed 3 values to a 2-placeholder query) which made

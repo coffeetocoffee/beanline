@@ -167,8 +167,9 @@ pub const Rest = struct {
             defer self.alloc.free(args);
             const wid = try self.escapeJson(r.worker_id);
             defer self.alloc.free(wid);
-            try w.print("{{\"id\":{d},\"queue\":\"{s}\",\"kind\":\"{s}\",\"args\":{s},\"status\":\"{s}\",\"priority\":{d},\"run_at_ms\":{d},\"attempts\":{d},\"max_attempts\":{d},\"lease_losses\":{d},\"max_lease_losses\":{d},\"lease_epoch\":{d},\"worker_id\":\"{s}\",\"inserted_ms\":{d},\"started_ms\":{d},\"finished_ms\":{d}}}", .{
-                r.id, q, k, args, @tagName(r.status), r.priority, r.run_at_ms, r.attempts, r.max_attempts, r.lease_losses, r.max_lease_losses, r.lease_epoch, wid, r.inserted_ms, r.started_ms, r.finished_ms,
+            const reason = if (r.dead_reason) |d| d.toSql() else "null";
+            try w.print("{{\"id\":{d},\"queue\":\"{s}\",\"kind\":\"{s}\",\"args\":{s},\"status\":\"{s}\",\"priority\":{d},\"run_at_ms\":{d},\"attempts\":{d},\"max_attempts\":{d},\"lease_losses\":{d},\"max_lease_losses\":{d},\"lease_epoch\":{d},\"worker_id\":\"{s}\",\"inserted_ms\":{d},\"started_ms\":{d},\"finished_ms\":{d},\"dead_reason\":{s}}}", .{
+                r.id, q, k, args, @tagName(r.status), r.priority, r.run_at_ms, r.attempts, r.max_attempts, r.lease_losses, r.max_lease_losses, r.lease_epoch, wid, r.inserted_ms, r.started_ms, r.finished_ms, reason,
             });
         }
         try w.writeAll("]}");
@@ -198,8 +199,9 @@ pub const Rest = struct {
         defer self.alloc.free(args);
         const wid = try self.escapeJson(r.worker_id);
         defer self.alloc.free(wid);
-        try w.print("{{\"id\":{d},\"queue\":\"{s}\",\"kind\":\"{s}\",\"args\":{s},\"status\":\"{s}\",\"priority\":{d},\"run_at_ms\":{d},\"attempts\":{d},\"max_attempts\":{d},\"lease_losses\":{d},\"max_lease_losses\":{d},\"lease_epoch\":{d},\"worker_id\":\"{s}\",\"inserted_ms\":{d},\"started_ms\":{d},\"finished_ms\":{d},\"events\":[", .{
-            r.id, q, k, args, @tagName(r.status), r.priority, r.run_at_ms, r.attempts, r.max_attempts, r.lease_losses, r.max_lease_losses, r.lease_epoch, wid, r.inserted_ms, r.started_ms, r.finished_ms,
+        const reason = if (r.dead_reason) |d| d.toSql() else "null";
+        try w.print("{{\"id\":{d},\"queue\":\"{s}\",\"kind\":\"{s}\",\"args\":{s},\"status\":\"{s}\",\"priority\":{d},\"run_at_ms\":{d},\"attempts\":{d},\"max_attempts\":{d},\"lease_losses\":{d},\"max_lease_losses\":{d},\"lease_epoch\":{d},\"worker_id\":\"{s}\",\"inserted_ms\":{d},\"started_ms\":{d},\"finished_ms\":{d},\"dead_reason\":{s},\"events\":[", .{
+            r.id, q, k, args, @tagName(r.status), r.priority, r.run_at_ms, r.attempts, r.max_attempts, r.lease_losses, r.max_lease_losses, r.lease_epoch, wid, r.inserted_ms, r.started_ms, r.finished_ms, reason,
         });
         for (evs.items, 0..) |e, i| {
             if (i > 0) try w.writeAll(",");
@@ -335,7 +337,7 @@ test "rest queues renders depth json" {
         fn finishCb(_: *anyopaque, _: []const u8, _: i64, _: u64) anyerror!void {
             return error.Unsupported;
         }
-        fn failCb(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: bool, _: i64, _: *broker_mod.FailOutcome) anyerror!void {
+        fn failCb(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: broker_mod.Failure, _: *broker_mod.FailOutcome) anyerror!void {
             return error.Unsupported;
         }
         fn cancelCb(_: *anyopaque, _: []const u8, _: i64, _: ?u64) anyerror!void {
@@ -401,7 +403,7 @@ test "rest enqueue parses body" {
         fn unsupportedFinish(_: *anyopaque, _: []const u8, _: i64, _: u64) anyerror!void {
             return error.Unsupported;
         }
-        fn unsupportedFail(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: bool, _: i64, _: *broker_mod.FailOutcome) anyerror!void {
+        fn unsupportedFail(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: broker_mod.Failure, _: *broker_mod.FailOutcome) anyerror!void {
             return error.Unsupported;
         }
         fn unsupportedCancel(_: *anyopaque, _: []const u8, _: i64, _: ?u64) anyerror!void {
@@ -473,7 +475,7 @@ test "rest rejects an enqueue whose payload does not fit the kind" {
         fn unsupportedFinish(_: *anyopaque, _: []const u8, _: i64, _: u64) anyerror!void {
             return error.Unsupported;
         }
-        fn unsupportedFail(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: bool, _: i64, _: *broker_mod.FailOutcome) anyerror!void {
+        fn unsupportedFail(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: broker_mod.Failure, _: *broker_mod.FailOutcome) anyerror!void {
             return error.Unsupported;
         }
         fn unsupportedCancel(_: *anyopaque, _: []const u8, _: i64, _: ?u64) anyerror!void {
@@ -554,7 +556,7 @@ test "rest uses the kind's own queue and attempt budget" {
         fn unsupportedFinish(_: *anyopaque, _: []const u8, _: i64, _: u64) anyerror!void {
             return error.Unsupported;
         }
-        fn unsupportedFail(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: bool, _: i64, _: *broker_mod.FailOutcome) anyerror!void {
+        fn unsupportedFail(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: broker_mod.Failure, _: *broker_mod.FailOutcome) anyerror!void {
             return error.Unsupported;
         }
         fn unsupportedCancel(_: *anyopaque, _: []const u8, _: i64, _: ?u64) anyerror!void {

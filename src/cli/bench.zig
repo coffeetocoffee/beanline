@@ -571,7 +571,11 @@ fn workerThread(shared: *Shared, index: u16) void {
                         var prng = std.Random.DefaultPrng.init(@bitCast(@as(u64, @intCast(job.id))));
                         retry_at = std.time.milliTimestamp() + @as(i64, @intCast(bo.delayMs(job.attempts + 1, 0, prng.random())));
                     }
-                    broker.fail(queue, job.id, job.lease_epoch, f.name, retryable, retry_at, &fo) catch {
+                    const failure: broker_mod.Failure = if (retryable)
+                        .{ .retry = retry_at }
+                    else
+                        .{ .non_retryable = {} };
+                    broker.fail(queue, job.id, job.lease_epoch, f.name, failure, &fo) catch {
                         st.errors += 1;
                         continue;
                     };
@@ -1093,7 +1097,7 @@ const MockBroker = struct {
         self.completed += 1;
     }
 
-    fn fail(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: bool, _: i64, out: *broker_mod.FailOutcome) anyerror!void {
+    fn fail(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: broker_mod.Failure, out: *broker_mod.FailOutcome) anyerror!void {
         out.* = .{};
     }
 

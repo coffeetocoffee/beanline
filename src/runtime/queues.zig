@@ -212,7 +212,7 @@ pub const Owner = struct {
         const entry = self.reg.get(c.kind) orelse {
             // Unknown kind: never retry, straight to dead.
             var out = broker_mod.FailOutcome{};
-            self.broker.fail(self.cfgs[qi].name, c.id, c.lease_epoch, "unknown_kind", false, 0, &out) catch |e| {
+            self.broker.fail(self.cfgs[qi].name, c.id, c.lease_epoch, "unknown_kind", .{ .non_retryable = {} }, &out) catch |e| {
                 std.log.warn("unknown_kind fail id={d}: {s}", .{ c.id, @errorName(e) });
             };
             return;
@@ -312,6 +312,7 @@ pub const Owner = struct {
         // dead-letter" is never given more than three attempts.
         const kind_budget: u32 = d.entry.max_attempts;
         const may_retry = f.class == .retryable and d.attempts < kind_budget;
+
         var retry_at: i64 = 0;
         if (may_retry) {
             const bo = d.entry.retry orelse self.default_retry;
@@ -319,9 +320,16 @@ pub const Owner = struct {
             const delay = bo.delayMs(d.attempts + 1, 0, prng.random());
             retry_at = std.time.milliTimestamp() + @as(i64, @intCast(delay));
         }
-        // A dead error, or an exhausted budget, never gets a retry_at: the
-        // broker dead-letters the job now.
-        self.broker.fail(qname, d.id, d.epoch, f.name, may_retry, retry_at, &out) catch |e| {
+
+        // Why the job stops, if it stops now: a permanent error, or an
+        // exhausted budget. Those are different causes, and the row records
+        // which one it was.
+        const failure: broker_mod.Failure = if (!may_retry)
+            (if (f.class == .retryable) .{ .attempts_exhausted = {} } else .{ .non_retryable = {} })
+        else
+            .{ .retry = retry_at };
+
+        self.broker.fail(qname, d.id, d.epoch, f.name, failure, &out) catch |e| {
             std.log.warn("fail id={d}: {s}", .{ d.id, @errorName(e) });
         };
     }

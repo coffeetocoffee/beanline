@@ -53,6 +53,51 @@ pub const Enqueued = struct {
     replaced: bool = false,
 };
 
+/// Why a job stopped without completing.
+///
+/// This is the machine-readable reason the architecture document asks for in
+/// §10.4. It is stored on the job row, so a dead-letter queue can be
+/// aggregated by cause instead of by reading event JSON and joining to the
+/// row.
+pub const DeadReason = enum {
+    /// The attempt budget ran out. The error itself was classified as worth
+    /// retrying, but there were no attempts left.
+    attempts_exhausted,
+    /// The handler returned an error the kind classified as permanent.
+    non_retryable,
+    /// The job lost too many leases: the handler kept killing its worker.
+    crash_loop,
+    /// An operator discarded the job.
+    discarded_by_operator,
+    /// The job was cancelled.
+    cancelled,
+
+    pub fn toSql(self: DeadReason) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn fromSql(s: []const u8) ?DeadReason {
+        inline for (@typeInfo(DeadReason).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @field(DeadReason, f.name);
+        }
+        return null;
+    }
+};
+
+/// What should happen to a job whose attempt just failed.
+///
+/// The caller states the intent in one value, so "the error is permanent" and
+/// "the error was fine but the budget is spent" cannot be confused with each
+/// other, and the broker does not have to guess which one it is looking at.
+pub const Failure = union(enum) {
+    /// The error is worth trying again. The value is when to try.
+    retry: i64,
+    /// The handler's error is permanent: the job is dead now.
+    non_retryable: void,
+    /// The error was worth retrying, but the attempt budget is spent.
+    attempts_exhausted: void,
+};
+
 pub const Claimed = struct {
     id: i64,
     queue: []const u8,
@@ -71,6 +116,8 @@ pub const FailOutcome = struct {
     status: Status = .available,
     retry_at_ms: i64 = 0,
     attempts: u32 = 0,
+    /// Why the job died, when it did. Null while the job is still live.
+    dead_reason: ?DeadReason = null,
 };
 
 pub const Depth = struct {
@@ -109,6 +156,9 @@ pub const JobRow = struct {
     inserted_ms: i64,
     started_ms: i64,
     finished_ms: i64,
+    /// Why the job stopped without completing. Null while it is still live,
+    /// and null for jobs that predate the column.
+    dead_reason: ?DeadReason = null,
 };
 
 /// A single job event row (audit trail view).
@@ -134,7 +184,7 @@ pub const VTable = struct {
     claim: *const fn (ctx: *anyopaque, queue: []const u8, limit: u32, worker_id: []const u8, lease_ms: u64, out: []Claimed) anyerror!usize,
     heartbeat: *const fn (ctx: *anyopaque, queue: []const u8, ids: []const i64, epochs: []const u64, lease_ms: u64) anyerror!void,
     finish: *const fn (ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64) anyerror!void,
-    fail: *const fn (ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, retryable: bool, retry_at_ms: i64, out: *FailOutcome) anyerror!void,
+    fail: *const fn (ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, failure: Failure, out: *FailOutcome) anyerror!void,
     cancel: *const fn (ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: ?u64) anyerror!void,
     promote: *const fn (ctx: *anyopaque, queues: []const []const u8, limit: u32) anyerror!u32,
     reap: *const fn (ctx: *anyopaque, queues: []const []const u8, limit: u32) anyerror!u32,
@@ -184,8 +234,8 @@ pub const Broker = struct {
         return self.vtable.finish(self.ptr, queue, id, lease_epoch);
     }
 
-    pub fn fail(self: Broker, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, retryable: bool, retry_at_ms: i64, out: *FailOutcome) anyerror!void {
-        return self.vtable.fail(self.ptr, queue, id, lease_epoch, err_name, retryable, retry_at_ms, out);
+    pub fn fail(self: Broker, queue: []const u8, id: i64, lease_epoch: u64, err_name: []const u8, failure: Failure, out: *FailOutcome) anyerror!void {
+        return self.vtable.fail(self.ptr, queue, id, lease_epoch, err_name, failure, out);
     }
 
     pub fn cancel(self: Broker, queue: []const u8, id: i64, lease_epoch: ?u64) anyerror!void {

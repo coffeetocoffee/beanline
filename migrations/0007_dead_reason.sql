@@ -1,0 +1,26 @@
+-- 0007_dead_reason: say why a job stopped without completing.
+--
+-- Until now the only way to tell a job that died of a permanent error from
+-- one that died of an exhausted attempt budget was to read the event trail
+-- and join it to the job row. A dead-letter queue could not be aggregated by
+-- cause: "how many of my jobs died of a permanent error and how many died of
+-- a budget" was a question with no query behind it.
+--
+-- dead_reason is that column. It is null while a job is live, and set when a
+-- job reaches a terminal state that is not 'completed':
+--
+--   attempts_exhausted     the attempt budget ran out. The error itself was
+--                           classified as worth retrying, but there were no
+--                           attempts left.
+--   non_retryable          the handler returned an error the kind classified
+--                           as permanent.
+--   crash_loop             the job lost too many leases: the handler kept
+--                           killing its worker.
+--   discarded_by_operator  an operator threw the job away.
+--   cancelled              the job was cancelled.
+--
+-- Jobs that were already dead when this migration ran keep a null reason:
+-- their cause is not recoverable after the fact. The event trail still has
+-- it.
+ALTER TABLE beanline_jobs
+    ADD COLUMN IF NOT EXISTS dead_reason TEXT;

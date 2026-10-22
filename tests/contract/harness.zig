@@ -97,9 +97,9 @@ pub const Fixture = struct {
         try self.broker.finish(self.queue, id, epoch);
     }
 
-    pub fn fail(self: *Fixture, id: i64, epoch: u64, err_name: []const u8, retryable: bool, retry_at_ms: i64) !broker.FailOutcome {
+    pub fn fail(self: *Fixture, id: i64, epoch: u64, err_name: []const u8, failure: broker.Failure) !broker.FailOutcome {
         var out = broker.FailOutcome{};
-        try self.broker.fail(self.queue, id, epoch, err_name, retryable, retry_at_ms, &out);
+        try self.broker.fail(self.queue, id, epoch, err_name, failure, &out);
         return out;
     }
 
