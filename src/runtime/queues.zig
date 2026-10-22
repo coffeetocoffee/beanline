@@ -2,7 +2,6 @@ const std = @import("std");
 const broker_mod = @import("../broker/broker.zig");
 const registry_mod = @import("../core/registry.zig");
 const backoff_mod = @import("backoff.zig");
-const errors_mod = @import("../core/errors.zig");
 const pool_mod = @import("pool.zig");
 const metrics_mod = @import("../obs/metrics.zig");
 const limiter_mod = @import("limiter.zig");
@@ -24,8 +23,8 @@ pub const QueueConfig = struct {
 pub const Options = struct {
     queues: []const QueueConfig,
     worker_name: []const u8 = "beanline",
-    retry: backoff_mod.Backoff = .{ .base_ms = 1000 },
-    dead_on: []const []const u8 = &.{},
+    /// Backoff for kinds that do not declare their own.
+    retry: backoff_mod.Backoff = .{},
     /// Optional metrics sink for the duration and end-to-end histograms.
     metrics: ?*metrics_mod.Metrics = null,
 };
@@ -39,10 +38,11 @@ pub const Dispatch = struct {
     epoch: u64,
     attempts: u32,
     args_json: []u8,
-    handler: job_mod.Handle,
+    /// The kind's resolved policy: payload schema, error classification and
+    /// backoff all live here.
+    entry: registry_mod.Entry,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    has_err: bool = false,
-    err: anyerror = error.NotRun,
+    outcome: job_mod.Outcome = .ok,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     deadline_ms: i64 = 0,
     was_stopped: bool = false,
@@ -50,23 +50,8 @@ pub const Dispatch = struct {
     started_ms: i64 = 0,
     kind: []const u8 = "",
 
-    fn finishOk(self: *Dispatch) void {
-        self.done.store(true, .release);
-    }
-
-    fn finishErr(self: *Dispatch, e: anyerror) void {
-        self.err = e;
-        self.has_err = true;
-        self.done.store(true, .release);
-    }
-
     fn run(self: *Dispatch) void {
         const owner = self.owner;
-        var parsed = std.json.parseFromSlice(job_mod.Args, owner.alloc, self.args_json, .{}) catch {
-            self.finishErr(error.BadPayload);
-            return;
-        };
-        defer parsed.deinit();
         var ctx = job_mod.Context{
             .job_id = self.id,
             .lease_epoch = self.epoch,
@@ -75,9 +60,11 @@ pub const Dispatch = struct {
             .stop_flag = &self.stop,
             .deadline_ms = self.deadline_ms,
         };
-        self.handler(&ctx, parsed.value) catch |e| self.finishErr(e);
+        // The kind's own runner decodes the payload into the kind's argument
+        // type and classifies the handler's error. The runtime does neither.
+        self.outcome = self.entry.runner(&ctx, owner.alloc, self.args_json);
         self.was_stopped = ctx.stopped();
-        self.finishOk();
+        self.done.store(true, .release);
     }
 
     fn taskFn(ptr: *anyopaque) void {
@@ -99,7 +86,8 @@ pub const Owner = struct {
     free_slots: std.ArrayListUnmanaged(usize) = .{},
     stop: bool = false,
     next_hb_ms: i64 = 0,
-    policy: errors_mod.RetryPolicy,
+    /// Backoff used by kinds that do not declare their own.
+    default_retry: backoff_mod.Backoff,
     items: [64]Claimed = undefined,
     metrics: ?*metrics_mod.Metrics,
 
@@ -113,10 +101,7 @@ pub const Owner = struct {
             .pool = pool,
             .cfgs = opts.queues,
             .worker_name = opts.worker_name,
-            .policy = .{
-                .backoff = opts.retry,
-                .dead_names = opts.dead_on,
-            },
+            .default_retry = opts.retry,
             .limiters = lims,
             .metrics = opts.metrics,
         };
@@ -224,7 +209,7 @@ pub const Owner = struct {
     }
 
     fn dispatchOrUpdate(self: *Owner, c: Claimed, qi: usize, now_ms: i64) anyerror!void {
-        const j = self.reg.get(c.kind) orelse {
+        const entry = self.reg.get(c.kind) orelse {
             // Unknown kind: never retry, straight to dead.
             var out = broker_mod.FailOutcome{};
             self.broker.fail(self.cfgs[qi].name, c.id, c.lease_epoch, "unknown_kind", false, 0, &out) catch |e| {
@@ -240,10 +225,10 @@ pub const Owner = struct {
             .epoch = c.lease_epoch,
             .attempts = c.attempts,
             .args_json = try self.alloc.dupe(u8, c.args_json),
-            .handler = j.handle,
-            .deadline_ms = if (j.timeout_ms == 0) 0 else now_ms + @as(i64, @intCast(j.timeout_ms)),
+            .entry = entry,
+            .deadline_ms = if (entry.timeout_ms == 0) 0 else now_ms + @as(i64, @intCast(entry.timeout_ms)),
             .started_ms = now_ms,
-            .kind = j.name,
+            .kind = entry.name,
         };
         try self.pool.submit(.{ .ptr = d, .run = Dispatch.taskFn });
         try self.running.append(self.alloc, d);
@@ -260,19 +245,22 @@ pub const Owner = struct {
             }
             const qname = self.cfgs[d.queue_idx].name;
             const stopped = d.stop.load(.acquire) or d.was_stopped;
-            if (self.metrics) |mx| self.recordOutcome(mx, d, stopped);
-            if (!d.has_err and stopped) {
-                // Cancelled/timeout: mark cancelled instead of completed.
-                self.broker.cancel(qname, d.id, d.epoch) catch |e| {
-                    std.log.warn("cancel on stop id={d}: {s}", .{ d.id, @errorName(e) });
-                };
-            } else if (!d.has_err) {
-                self.broker.finish(qname, d.id, d.epoch) catch |e| {
-                    // Lease was taken over or job got cancelled: log and drop.
-                    std.log.warn("fencing: finish id={d} epoch={d} got {s}", .{ d.id, d.epoch, @errorName(e) });
-                };
-            } else {
-                try self.reportFailure(d, qname);
+            if (self.metrics) |mx| recordOutcome(mx, d, stopped);
+            switch (d.outcome) {
+                .ok => {
+                    if (stopped) {
+                        // Cancelled/timeout: mark cancelled instead of completed.
+                        self.broker.cancel(qname, d.id, d.epoch) catch |e| {
+                            std.log.warn("cancel on stop id={d}: {s}", .{ d.id, @errorName(e) });
+                        };
+                    } else {
+                        self.broker.finish(qname, d.id, d.epoch) catch |e| {
+                            // Lease was taken over or job got cancelled: log and drop.
+                            std.log.warn("fencing: finish id={d} epoch={d} got {s}", .{ d.id, d.epoch, @errorName(e) });
+                        };
+                    }
+                },
+                .failed => try self.reportFailure(d, qname),
             }
             self.alloc.free(d.args_json);
             self.alloc.destroy(d);
@@ -283,22 +271,26 @@ pub const Owner = struct {
     /// Bump the counter and both histograms for one finished attempt. Duration
     /// is the handler's wall time; the e2e series is measured from `run_at`
     /// (enqueue time), so retry backoff widens it the way §15 describes.
-    fn recordOutcome(self: *Owner, mx: *metrics_mod.Metrics, d: *Dispatch, stopped: bool) void {
+    fn recordOutcome(mx: *metrics_mod.Metrics, d: *Dispatch, stopped: bool) void {
         const now = std.time.milliTimestamp();
         const kind = d.kind;
-        if (d.has_err) {
-            const cls = self.policy.classOf(@errorName(d.err));
-            mx.incrFailed(kind);
-            const outcome: metrics_mod.Metrics.Outcome = if (cls == .retryable) .failed else .dead;
-            mx.observeJobDuration(kind, outcome, elapsedMicros(d, now));
-            mx.observeE2E(kind, outcome, elapsedMicros(d, now));
-        } else if (stopped) {
-            mx.observeJobDuration(kind, .cancelled, elapsedMicros(d, now));
-            mx.observeE2E(kind, .cancelled, elapsedMicros(d, now));
-        } else {
-            mx.incrCompleted(kind);
-            mx.observeJobDuration(kind, .completed, elapsedMicros(d, now));
-            mx.observeE2E(kind, .completed, elapsedMicros(d, now));
+        switch (d.outcome) {
+            .failed => |f| {
+                mx.incrFailed(kind);
+                const outcome: metrics_mod.Metrics.Outcome = if (f.class == .retryable) .failed else .dead;
+                mx.observeJobDuration(kind, outcome, elapsedMicros(d, now));
+                mx.observeE2E(kind, outcome, elapsedMicros(d, now));
+            },
+            .ok => {
+                if (stopped) {
+                    mx.observeJobDuration(kind, .cancelled, elapsedMicros(d, now));
+                    mx.observeE2E(kind, .cancelled, elapsedMicros(d, now));
+                } else {
+                    mx.incrCompleted(kind);
+                    mx.observeJobDuration(kind, .completed, elapsedMicros(d, now));
+                    mx.observeE2E(kind, .completed, elapsedMicros(d, now));
+                }
+            },
         }
     }
 
@@ -308,22 +300,17 @@ pub const Owner = struct {
     }
 
     fn reportFailure(self: *Owner, d: *Dispatch, qname: []const u8) !void {
-        const err_name = @errorName(d.err);
+        const f = d.outcome.failed;
         var out = broker_mod.FailOutcome{};
-        if (std.mem.eql(u8, err_name, "UnknownKind")) {
-            self.broker.fail(qname, d.id, d.epoch, "unknown_kind", false, 0, &out) catch |e| {
-                std.log.warn("fail id={d}: {s}", .{ d.id, @errorName(e) });
-            };
-            return;
-        }
-        const cls = self.policy.classOf(err_name);
         var retry_at: i64 = 0;
-        if (cls == .retryable) {
+        if (f.class == .retryable) {
+            const bo = d.entry.retry orelse self.default_retry;
             var prng = std.Random.DefaultPrng.init(@bitCast(@as(u64, @intCast(d.id)) ^ (@as(u64, d.attempts) << 8)));
-            const delay = self.policy.backoff.delayMs(d.attempts + 1, 0, prng.random());
+            const delay = bo.delayMs(d.attempts + 1, 0, prng.random());
             retry_at = std.time.milliTimestamp() + @as(i64, @intCast(delay));
         }
-        self.broker.fail(qname, d.id, d.epoch, err_name, cls == .retryable, retry_at, &out) catch |e| {
+        // A dead error never gets a retry_at: the broker dead-letters it now.
+        self.broker.fail(qname, d.id, d.epoch, f.name, f.class == .retryable, retry_at, &out) catch |e| {
             std.log.warn("fail id={d}: {s}", .{ d.id, @errorName(e) });
         };
     }
@@ -377,7 +364,7 @@ test "fairness pick with refreshed slots" {
         .pool = undefined,
         .cfgs = &.{},
         .worker_name = "",
-        .policy = .{},
+        .default_retry = .{},
         .metrics = null,
     };
     o.fair.setWeights(&[_]u32{ 1, 1 });

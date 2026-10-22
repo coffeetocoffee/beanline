@@ -16,6 +16,17 @@ const dash_server = @import("../dash/server.zig");
 
 var g_stop = std.atomic.Value(bool).init(false);
 
+/// The demo kind: accepts any JSON payload and does nothing. Registered
+/// automatically so a fresh worker has something to run and a fresh dashboard
+/// has something to enqueue.
+const demo_kind = job.Kind(std.json.Value, error{}).new(.{
+    .name = "demo.noop",
+    .queue = "default",
+    .handle = struct {
+        fn run(_: *job.Context, _: std.json.Value) error{}!void {}
+    }.run,
+});
+
 fn onCtrl(ctrl: u32) callconv(.C) i32 {
     if (ctrl <= 4) {
         g_stop.store(true, .seq_cst);
@@ -108,11 +119,12 @@ pub const App = struct {
         self.log.deinit();
     }
 
-    pub fn register(self: *App, j: job.Job) !void {
-        try self.reg.register(j);
+    /// Register a job kind. The kind carries its own payload schema, retry
+    /// classification and backoff, so the runtime needs no per-kind
+    /// configuration and no name-based error matching.
+    pub fn register(self: *App, k: anytype) !void {
+        try self.reg.register(registry.entryFor(@TypeOf(k), k));
     }
-
-    fn noopStdHandle(_: *job.Context, _: job.Args) anyerror!void {}
 
     fn envOpt(self: *App, name: []const u8) !?[]u8 {
         const v = std.process.getEnvVarOwned(self.alloc, name) catch |e| {
@@ -159,7 +171,7 @@ pub const App = struct {
     /// the dashboard from this process.
     pub fn run(self: *App) !u8 {
         if (self.reg.get("demo.noop") == null) {
-            try self.register(.{ .name = "demo.noop", .queue = "default", .handle = noopStdHandle });
+            try self.register(demo_kind);
         }
 
         const br = self.openBroker() catch |e| {
@@ -190,13 +202,18 @@ pub const App = struct {
         try pool.start(total_slots);
         defer pool.shutdown();
 
-        var owner = try queue_mod.Owner.init(self.alloc, br, &self.reg, &pool, .{ .queues = cfgs.items, .worker_name = "beanline", .metrics = &self.metrics });
+        var owner = try queue_mod.Owner.init(self.alloc, br, &self.reg, &pool, .{
+            .queues = cfgs.items,
+            .worker_name = "beanline",
+            .retry = self.cfg.defaultBackoff(),
+            .metrics = &self.metrics,
+        });
         defer owner.deinit();
 
         // Optional dashboard tier in-process.
         var server_storage: ?dash_server.Server = null;
         if (self.cfg.dashboard_enabled) {
-            var srv = dash_server.Server.init(
+            var srv = dash_server.Server.initWithKinds(
                 self.alloc,
                 br,
                 &self.auth,
@@ -207,6 +224,8 @@ pub const App = struct {
                 self.cfg.dashboard_bind,
                 self.cfg.dashboard_readonly,
                 computeSecureCookies(self.cfg),
+                &self.reg,
+                self.cfg.max_attempts,
             );
             srv.start() catch |e| {
                 self.log.err("dashboard: failed to start ({s})", .{@errorName(e)});
@@ -285,7 +304,7 @@ pub const App = struct {
         self.queue_conc.clearRetainingCapacity();
         self.cfg.queueConcurrency(&self.queue_names, &self.queue_conc) catch {};
 
-        var srv = dash_server.Server.init(
+        var srv = dash_server.Server.initWithKinds(
             self.alloc,
             br,
             &self.auth,
@@ -296,6 +315,8 @@ pub const App = struct {
             self.cfg.dashboard_bind,
             self.cfg.dashboard_readonly,
             computeSecureCookies(self.cfg),
+            &self.reg,
+            self.cfg.max_attempts,
         );
         srv.start() catch |e| {
             self.log.err("server: failed to start ({s})", .{@errorName(e)});

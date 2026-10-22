@@ -44,7 +44,7 @@ Why Zig is the right tool for this:
 - One static binary per OS/arch: trivial deployment, fast startup (<100 ms),
   small footprint (<50 MB RSS baseline per worker process).
 - Comptime type safety: job argument schemas are Zig structs; payloads are
-  validated at deserialization against a known type, and retry classes can be
+  validated at deserialization against a known type, and retry classes are
   derived from declared error sets instead of runtime string matching.
 - Structured concurrency: `spawn` + explicit supervisor tree make "no orphaned
   task, no leaked job" a compile-time discipline rather than a convention.
@@ -696,20 +696,30 @@ pub const SendEmailError = error{
     QuotaExceeded,        // retryable with per-kind override (retry_after hint)
 };
 
-const send_email = beanline.Job(SendEmailArgs){
+const send_email = beanline.Kind(SendEmailArgs, SendEmailError).new(.{
     .name = "emails.send",
     .errors = .{
         .retryable = &.{ .SmtpTransient, .DnsTimeout, .QuotaExceeded },
-        .dead_on = .{ .AddressInvalid },
+        .dead_on = &.{ .AddressInvalid },
     },
     ...
-};
+});
 ```
 
 A kind's error set is comptime-checked: every error value must land in exactly
 one class or the build fails. This turns "did we classify this bug as retryable"
 into a compiler error instead of a 3 a.m. incident where the queue burned 25
 attempts on a permanent failure.
+
+The check runs in `Kind.new`, which is evaluated at compile time. The
+classification is then baked into the kind's runner: the runtime never
+matches an error name against a list, and a payload that does not fit the
+kind's schema is classified dead on the first attempt (it is permanent, so
+retrying it could never succeed).
+
+Implementation: `core/errors.zig` holds the partition check and the
+comptime-unrolled classifier; `core/job.zig` builds the per-kind runner;
+`core/registry.zig` stores the resolved, type-erased entry.
 
 ### 10.4 Dead letter queue
 
@@ -754,7 +764,7 @@ pair (fencing token, idempotent handler). Documentation and handler templates
 push the pattern:
 
 ```zig
-fn charge(ctx: beanline.Context, a: ChargeArgs) !void {
+fn charge(ctx: *beanline.JobContext, a: ChargeArgs) ChargeError!void {
     // a.lease_epoch is the fencing token:
     try db.exec(
         "UPDATE invoices SET status='paid' WHERE id=$1 AND applied_epoch < $2",
@@ -957,36 +967,42 @@ beanline bench  --backend both --duration 120s          # workload generator
 const beanline = @import("beanline");
 
 const SendEmailArgs = struct { to: []const u8, subject: []const u8, tpl: []const u8 };
-const send_email = beanline.Job(SendEmailArgs){
+const SendEmailError = error{ SmtpTransient, DnsTimeout, AddressInvalid };
+
+const send_email = beanline.Kind(SendEmailArgs, SendEmailError).new(.{
     .name = "emails.send",
     .queue = "mailers",
     .max_attempts = 5,
-    .retry = .{ .exponential = .{ .base_ms = 1000, .cap_ms = 30 * 60_000,
-                                  .jitter = .full } },
-    .errors = .{ .retryable = &.{ .SmtpTransient, .DnsTimeout },
-                 .dead_on = .{ .AddressInvalid } },
+    .retry = .{ .base_ms = 1000, .cap_ms = 30 * 60_000, .jitter = .full },
+    .errors = .{ .retryable = &.{ error.SmtpTransient, error.DnsTimeout },
+                 .dead_on = &.{ error.AddressInvalid } },
     .handle = struct {
-        fn run(ctx: beanline.Context, a: SendEmailArgs) !void {
-            ctx.log.info("sending", .{ .to = a.to });
+        fn run(ctx: *beanline.JobContext, a: SendEmailArgs) SendEmailError!void {
             try smtp.send(ctx.alloc, .{ .to = a.to, .subject = a.subject });
         }
     }.run,
-};
+});
 
 pub fn main(alloc: std.mem.Allocator) !u8 {
-    var app = try beanline.App.init(alloc, try beanline.Config.load());
-    try app.registerKinds(&.{ send_email, resize_image, reconcile });
-    try app.addSchedule(.{ .id = "nightly-rollup", .kind = "reports.rollup",
-                           .cron = "30 2 * * *", .tz = "Europe/Berlin",
-                           .misfire = .skip });
+    var app = try beanline.App.init(alloc);
+    try app.register(send_email);
 
     // transactional enqueue, PG mode:
-    try app.enqueue(&conn, resize_image, .{ .src = key, .w = 1024 },
-                    .{ .unique_key = key, .unique = .until_complete });
+    try beanline.enqueueIn(&conn, alloc, "images.resize", args_json, .{
+        .queue = "media",
+        .unique_key = key,
+        .unique = .until_complete,
+    }, &out);
 
     return app.run(); // supervisor, signals, graceful shutdown
 }
 ```
+
+`Kind(Args, ErrorSet)` is generic over the payload type and the handler's
+error set, so the schema and the classification are part of the kind's type.
+`Kind.new` is evaluated at compile time and runs the partition check, which is
+why an unclassified error is a build error. `App.register` takes a kind of
+any type, so kinds with different payload shapes register side by side.
 
 Library mode and daemon mode are the same binary and code path; an app can
 embed workers in-process or run `beanline worker` against the same DB and register
@@ -1002,7 +1018,7 @@ beanline/
   build.zig
   src/
     beanline.zig                 // public surface (one @import)
-    core/    job.zig registry.zig args.zig errors.zig context.zig
+    core/    job.zig registry.zig errors.zig
     broker/  broker.zig (iface) postgres.zig redis.zig
              lua/claim.lua promote.lua reap.lua
              pg/(vendored pg.zig) resp/(in-house client)
@@ -1066,8 +1082,9 @@ papering over it.
   command's own checks).
 - Dashboard: see 14.3/14.4. Admin POSTs require scope + CSRF; operator actions
   are event-logged with actor identity.
-- Payload policy: arg structs can annotate fields `sensitive = true` (masked in
-  UI, stripped in logs, excluded from metrics labels).
+- Payload policy: a kind declares its sensitive field names in the kind spec
+  (`sensitive = &.{"subject"}`); those fields are redacted in the dashboard
+  and stripped from logs. Metrics labels never carry payload values.
 - Supply chain: vendored deps pinned with hashes in `deps.zig`; CI runs
   `zig fmt --check`, semgrep-style scan, SBOM generation (CycloneDX) per release.
 - Fuzzing: RESP decoder, JSON/args path, cron parser, Lua output parsing are all

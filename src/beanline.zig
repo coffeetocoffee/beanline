@@ -3,9 +3,12 @@ const cli = @import("cli/main.zig");
 
 pub const version = std.SemanticVersion{ .major = 0, .minor = 7, .patch = 0 };
 
-pub const Job = @import("core/job.zig").Job;
-pub const Args = @import("core/job.zig").Args;
+/// A registered job kind. Generic over the payload type and the handler's
+/// error set: `beanline.Kind(Args, ErrorSet).new(.{ ... })`.
+pub const Kind = @import("core/job.zig").Kind;
 pub const JobContext = @import("core/job.zig").Context;
+pub const JobOutcome = @import("core/job.zig").Outcome;
+pub const JobFailure = @import("core/job.zig").Failure;
 /// Low-level building blocks, exported so the fuzz targets in tests/fuzz can
 /// reach them without importing files outside their own module path.
 pub const Resp = @import("broker/resp/client.zig");
@@ -41,7 +44,12 @@ pub fn enqueueIn(conn: *PgConn, alloc: std.mem.Allocator, kind: []const u8, args
 }
 pub const App = @import("runtime/supervisor.zig").App;
 pub const Broker = @import("broker/broker.zig").Broker;
-pub const RetryPolicy = @import("core/errors.zig").RetryPolicy;
+pub const RetryPolicy = @import("core/errors.zig").Policy;
+pub const ErrorClass = @import("core/errors.zig").Class;
+pub const Registry = @import("core/registry.zig").Registry;
+pub const RegistryEntry = @import("core/registry.zig").Entry;
+/// Resolve a kind into its type-erased registry entry.
+pub const entryForKind = @import("core/registry.zig").entryFor;
 pub const Backoff = @import("runtime/backoff.zig").Backoff;
 pub const Cron = @import("sched/cron.zig").Schedule;
 pub const Zone = @import("sched/tz.zig").Zone;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const auth_mod = @import("dash/auth.zig");
+const backoff_mod = @import("runtime/backoff.zig");
 
 /// Beanline process configuration. Loaded from BEANLINE_* environment
 /// variables (precedence: env > defaults; CLI flags are handled by the CLI).
@@ -18,6 +19,13 @@ pub const Config = struct {
     default_concurrency: u32 = 4,
     lease_ms: u64 = 30_000,
     drain_timeout_ms: u64 = 30_000,
+    /// Default retry backoff for kinds that do not declare their own.
+    retry_base_ms: u64 = 1000,
+    retry_cap_ms: u64 = 30 * 60 * 1000,
+    retry_factor: f64 = 2.0,
+    retry_jitter: backoff_mod.Jitter = .full,
+    /// Attempt budget for jobs enqueued without a registered kind.
+    max_attempts: u32 = 25,
     retention_completed_ms: i64 = 72 * 60 * 60 * 1000,
     retention_events_ms: i64 = 7 * 24 * 60 * 60 * 1000,
     aging_interval_ms: u64 = 5 * 60 * 1000,
@@ -64,6 +72,16 @@ pub const Config = struct {
             }
         }
     }
+
+    /// The retry backoff used by kinds that do not declare their own.
+    pub fn defaultBackoff(self: *const Config) backoff_mod.Backoff {
+        return .{
+            .base_ms = self.retry_base_ms,
+            .cap_ms = self.retry_cap_ms,
+            .factor = self.retry_factor,
+            .jitter = self.retry_jitter,
+        };
+    }
 };
 
 fn envOwned(alloc: std.mem.Allocator, name: []const u8) !?[]const u8 {
@@ -85,11 +103,29 @@ fn envNum(comptime T: type, name: []const u8, default: T) !T {
     return std.fmt.parseInt(T, v, 10) catch default;
 }
 
+fn envFloat(name: []const u8, default: f64) f64 {
+    const v = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return default;
+    defer std.heap.page_allocator.free(v);
+    if (v.len == 0) return default;
+    return std.fmt.parseFloat(f64, v) catch default;
+}
+
 fn envBool(name: []const u8, default: bool) bool {
     const v = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return default;
     defer std.heap.page_allocator.free(v);
     if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "yes")) return true;
     if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no")) return false;
+    return default;
+}
+
+/// Parse a backoff jitter name. An unknown name keeps the default rather than
+/// failing the process: a typo in a tuning knob should not stop the worker.
+fn envJitter(name: []const u8, default: backoff_mod.Jitter) backoff_mod.Jitter {
+    const v = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return default;
+    defer std.heap.page_allocator.free(v);
+    inline for (@typeInfo(backoff_mod.Jitter).@"enum".fields) |f| {
+        if (std.mem.eql(u8, v, f.name)) return @field(backoff_mod.Jitter, f.name);
+    }
     return default;
 }
 
@@ -138,6 +174,11 @@ pub fn load() Config {
     c.default_concurrency = envNum(u32, "BEANLINE_QUEUE_CONCURRENCY", 4) catch 4;
     c.lease_ms = envNum(u64, "BEANLINE_LEASE_MS", 30_000) catch 30_000;
     c.drain_timeout_ms = envNum(u64, "BEANLINE_DRAIN_TIMEOUT_MS", 30_000) catch 30_000;
+    c.retry_base_ms = envNum(u64, "BEANLINE_RETRY_BASE_MS", 1000) catch 1000;
+    c.retry_cap_ms = envNum(u64, "BEANLINE_RETRY_CAP_MS", 30 * 60 * 1000) catch 30 * 60 * 1000;
+    c.retry_factor = envFloat("BEANLINE_RETRY_FACTOR", 2.0);
+    c.retry_jitter = envJitter("BEANLINE_RETRY_JITTER", .full);
+    c.max_attempts = envNum(u32, "BEANLINE_MAX_ATTEMPTS", 25) catch 25;
     c.retention_completed_ms = envNum(i64, "BEANLINE_RETENTION_COMPLETED_MS", 72 * 60 * 60 * 1000) catch 72 * 60 * 60 * 1000;
     c.retention_events_ms = envNum(i64, "BEANLINE_RETENTION_EVENTS_MS", 7 * 24 * 60 * 60 * 1000) catch 7 * 24 * 60 * 60 * 1000;
     c.aging_interval_ms = envNum(u64, "BEANLINE_AGING_INTERVAL_MS", 5 * 60 * 1000) catch 5 * 60 * 1000;

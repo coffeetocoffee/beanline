@@ -21,6 +21,21 @@ planned and will use the same struct.
 | `BEANLINE_LEASE_MS` | `30000` | Lease duration. Minimum 15 s. |
 | `BEANLINE_DRAIN_TIMEOUT_MS` | `30000` | How long running jobs may finish during shutdown. |
 
+## Retries
+
+Retry policy is per kind: a kind declares its own backoff and its own error
+classification, and the classification is checked by the compiler (an
+unclassified error is a build error). The variables below are the default for
+kinds that do not declare a backoff of their own.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BEANLINE_RETRY_BASE_MS` | `1000` | Base delay of the exponential backoff. |
+| `BEANLINE_RETRY_CAP_MS` | `1800000` (30 min) | Maximum delay between attempts. |
+| `BEANLINE_RETRY_FACTOR` | `2.0` | Growth factor of the exponential backoff. |
+| `BEANLINE_RETRY_JITTER` | `full` | Jitter mode: `none`, `full`, `equal` or `decorrelated`. |
+| `BEANLINE_MAX_ATTEMPTS` | `25` | Attempt budget for jobs enqueued for a kind this process does not know. A kind that is known uses its own `max_attempts`. |
+
 ## Retention
 
 | Variable | Default | Meaning |

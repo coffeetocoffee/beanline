@@ -798,6 +798,204 @@ fn probe_oldest_available_ms(f: *Fixture) !void {
     }
 }
 
+// ---------------------------------------------------------------- runtime layer
+//
+// Everything above this line drives the broker directly. The cases below
+// drive the *runtime*: the real owner, the real pool, the real registry, the
+// real per-kind payload decode and the real per-kind error classification.
+// The broker cases could all pass while the runtime was unable to run a job
+// with a real payload, because they never reach the runtime.
+
+const RuntimeMailArgs = struct { to: []const u8, subject: []const u8 };
+const RuntimeInvoiceArgs = struct { cents: u64, note: []const u8 };
+
+const runtime_mail = beanline.Kind(RuntimeMailArgs, error{}).new(.{
+    .name = "ct.mail",
+    .queue = "default",
+    .handle = struct {
+        fn run(_: *beanline.JobContext, _: RuntimeMailArgs) error{}!void {}
+    }.run,
+});
+
+const runtime_invoice = beanline.Kind(RuntimeInvoiceArgs, error{}).new(.{
+    .name = "ct.invoice",
+    .queue = "default",
+    .handle = struct {
+        fn run(_: *beanline.JobContext, _: RuntimeInvoiceArgs) error{}!void {}
+    }.run,
+});
+
+const runtime_dead = beanline.Kind(RuntimeMailArgs, error{Permanent}).new(.{
+    .name = "ct.dead",
+    .queue = "default",
+    .errors = .{ .dead_on = &.{error.Permanent} },
+    .handle = struct {
+        fn run(_: *beanline.JobContext, _: RuntimeMailArgs) error{Permanent}!void {
+            return error.Permanent;
+        }
+    }.run,
+});
+
+const runtime_flaky = beanline.Kind(RuntimeMailArgs, error{Transient}).new(.{
+    .name = "ct.flaky",
+    .queue = "default",
+    .errors = .{ .retryable = &.{error.Transient} },
+    .retry = .{ .base_ms = 10, .cap_ms = 50 },
+    .handle = struct {
+        fn run(_: *beanline.JobContext, _: RuntimeMailArgs) error{Transient}!void {
+            return error.Transient;
+        }
+    }.run,
+});
+
+fn runtimeRegistry() !beanline.Registry {
+    var reg = beanline.Registry.init(std.testing.allocator);
+    errdefer reg.deinit();
+    try reg.register(beanline.entryForKind(@TypeOf(runtime_mail), runtime_mail));
+    try reg.register(beanline.entryForKind(@TypeOf(runtime_invoice), runtime_invoice));
+    try reg.register(beanline.entryForKind(@TypeOf(runtime_dead), runtime_dead));
+    try reg.register(beanline.entryForKind(@TypeOf(runtime_flaky), runtime_flaky));
+    return reg;
+}
+
+/// Drive the real worker loop until `stop` says the expected state is
+/// reached, then drain.
+fn driveOwner(
+    f: *Fixture,
+    reg: *beanline.Registry,
+    timeout_ms: i64,
+    stop: *const fn (broker.Depth) bool,
+) !void {
+    var pool = beanline.Pool{ .alloc = f.alloc };
+    try pool.start(2);
+    defer pool.shutdown();
+
+    const cfgs = [_]beanline.QueueConfig{.{ .name = f.queue, .concurrency = 2, .lease_ms = 5000 }};
+    var owner = try beanline.Owner.init(f.alloc, f.broker, reg, &pool, .{
+        .queues = &cfgs,
+        .worker_name = "ct-runtime",
+        .retry = .{ .base_ms = 10, .cap_ms = 50 },
+    });
+    defer owner.deinit();
+
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (std.time.milliTimestamp() < deadline) {
+        const n = try owner.tick(std.time.milliTimestamp());
+        var d = broker.Depth{};
+        try f.broker.depth(f.queue, &d);
+        if (stop(d)) break;
+        if (n == 0 and owner.inflight() == 0 and d.available == 0 and d.running == 0) break;
+        std.time.sleep(if (n == 0) 25 else 5);
+    }
+
+    owner.signalStop();
+    const settle = std.time.milliTimestamp() + 2000;
+    while (owner.inflight() > 0 and std.time.milliTimestamp() < settle) {
+        std.time.sleep(2);
+        _ = try owner.tick(std.time.milliTimestamp());
+    }
+}
+
+fn stopCompleted(d: broker.Depth) bool {
+    return d.completed >= 2 and d.available == 0 and d.running == 0;
+}
+
+fn stopDead(d: broker.Depth) bool {
+    return d.dead >= 1 and d.available == 0 and d.running == 0;
+}
+
+/// Two kinds with different payload schemas run side by side. The queue used
+/// to hardcode one struct for every kind, so this could not even be
+/// expressed.
+fn case_runtime_runs_multiple_payload_shapes(f: *Fixture) !void {
+    var reg = try runtimeRegistry();
+    defer reg.deinit();
+
+    _ = try f.enqueue("ct.mail", "{\"to\":\"a\",\"subject\":\"s\"}", .{ .queue = f.queue, .run_at_ms = 0 });
+    _ = try f.enqueue("ct.invoice", "{\"cents\":1200,\"note\":\"n\"}", .{ .queue = f.queue, .run_at_ms = 0 });
+
+    try driveOwner(f, &reg, 10000, stopCompleted);
+
+    const d = try f.depth();
+    try std.testing.expectEqual(@as(u64, 2), d.completed);
+    try std.testing.expectEqual(@as(u64, 0), d.dead);
+    try std.testing.expectEqual(@as(u64, 0), d.available);
+}
+
+/// An error the kind classified as dead dead-letters on the first attempt.
+/// Before per-kind classification existed, every error was retryable and the
+/// job burned its whole attempt budget (25 attempts, hours of backoff)
+/// before landing in the dead letter.
+fn case_runtime_dead_classification_fails_fast(f: *Fixture) !void {
+    var reg = try runtimeRegistry();
+    defer reg.deinit();
+
+    const enq = try f.enqueue("ct.dead", "{\"to\":\"a\",\"subject\":\"s\"}", .{ .queue = f.queue, .run_at_ms = 0 });
+
+    try driveOwner(f, &reg, 10000, stopDead);
+
+    const d = try f.depth();
+    try std.testing.expectEqual(@as(u64, 1), d.dead);
+    try std.testing.expectEqual(@as(u64, 0), d.available);
+
+    const row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.dead, row.status);
+    try std.testing.expectEqual(@as(u32, 1), row.attempts);
+}
+
+/// A payload that does not fit the kind's schema is permanent: it
+/// dead-letters on the first attempt instead of being retried until the
+/// attempt budget runs out.
+fn case_runtime_bad_payload_is_dead_on_first_attempt(f: *Fixture) !void {
+    var reg = try runtimeRegistry();
+    defer reg.deinit();
+
+    // Missing "subject": does not fit RuntimeMailArgs.
+    const enq = try f.enqueue("ct.mail", "{\"to\":\"a\"}", .{ .queue = f.queue, .run_at_ms = 0 });
+
+    try driveOwner(f, &reg, 10000, stopDead);
+
+    const d = try f.depth();
+    try std.testing.expectEqual(@as(u64, 1), d.dead);
+
+    const row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.dead, row.status);
+    try std.testing.expectEqual(@as(u32, 1), row.attempts);
+}
+
+/// An error the kind classified as retryable goes back on the queue instead
+/// of dead-lettering.
+fn case_runtime_retryable_error_is_retried(f: *Fixture) !void {
+    var reg = try runtimeRegistry();
+    defer reg.deinit();
+
+    const enq = try f.enqueue("ct.flaky", "{\"to\":\"a\",\"subject\":\"s\"}", .{ .queue = f.queue, .run_at_ms = 0 });
+
+    var pool = beanline.Pool{ .alloc = f.alloc };
+    try pool.start(2);
+    defer pool.shutdown();
+    const cfgs = [_]beanline.QueueConfig{.{ .name = f.queue, .concurrency = 2, .lease_ms = 5000 }};
+    var owner = try beanline.Owner.init(f.alloc, f.broker, &reg, &pool, .{
+        .queues = &cfgs,
+        .worker_name = "ct-runtime",
+        .retry = .{ .base_ms = 10, .cap_ms = 50 },
+    });
+    defer owner.deinit();
+
+    const deadline = std.time.milliTimestamp() + 10000;
+    while (std.time.milliTimestamp() < deadline) {
+        _ = try owner.tick(std.time.milliTimestamp());
+        const row = (try f.getJob(enq.id)).?;
+        if (row.attempts >= 1 and row.status == broker.Status.available) break;
+        std.time.sleep(10);
+    }
+    owner.signalStop();
+
+    const row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.available, row.status);
+    try std.testing.expect(row.attempts >= 1);
+}
+
 // ---------------------------------------------------------------- case list
 
 pub const contract_cases = [_]harness.Case{
@@ -853,6 +1051,10 @@ pub const contract_cases = [_]harness.Case{
     .{ .name = "capabilities-named-backend", .queue = "caps-name", .run = case_capabilities_named_backend },
     .{ .name = "capabilities-transactional-enqueue", .queue = "caps-tx", .run = case_capabilities_transactional_enqueue },
     .{ .name = "transactional-enqueue-commit-rollback", .queue = "tx-enq", .run = case_transactional_enqueue },
+    .{ .name = "runtime-runs-multiple-payload-shapes", .queue = "rt-shapes", .run = case_runtime_runs_multiple_payload_shapes },
+    .{ .name = "runtime-dead-classification-fails-fast", .queue = "rt-dead", .run = case_runtime_dead_classification_fails_fast },
+    .{ .name = "runtime-bad-payload-dead-on-first-attempt", .queue = "rt-badpay", .run = case_runtime_bad_payload_is_dead_on_first_attempt },
+    .{ .name = "runtime-retryable-error-is-retried", .queue = "rt-retry", .run = case_runtime_retryable_error_is_retried },
 };
 
 pub const divergence_probes = [_]harness.Probe{

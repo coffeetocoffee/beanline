@@ -1,6 +1,8 @@
 const std = @import("std");
 const broker_mod = @import("../broker/broker.zig");
 const auth_mod = @import("auth.zig");
+const registry_mod = @import("../core/registry.zig");
+const job_mod = @import("../core/job.zig");
 
 /// REST API layer for the dashboard. Every response body is a JSON string the
 /// caller owns. Mutations go through the same Broker primitives as the
@@ -8,9 +10,33 @@ const auth_mod = @import("auth.zig");
 pub const Rest = struct {
     alloc: std.mem.Allocator,
     broker: broker_mod.Broker,
+    /// The registered kinds, when this process knows them. The dashboard tier
+    /// and the worker tier are often separate processes: a kind the dashboard
+    /// does not know is still accepted, because the worker owns the schema.
+    reg: ?*const registry_mod.Registry = null,
+    /// Attempt budget for jobs enqueued for a kind this process does not know.
+    default_max_attempts: u32 = 25,
 
     pub fn init(alloc: std.mem.Allocator, broker: broker_mod.Broker) Rest {
         return .{ .alloc = alloc, .broker = broker };
+    }
+
+    /// Build a REST layer that knows the registered kinds. With a registry the
+    /// dashboard can validate an enqueue against the kind's schema, use the
+    /// kind's own queue and attempt budget, and redact the kind's sensitive
+    /// fields.
+    pub fn initWithKinds(
+        alloc: std.mem.Allocator,
+        broker: broker_mod.Broker,
+        reg: *const registry_mod.Registry,
+        default_max_attempts: u32,
+    ) Rest {
+        return .{
+            .alloc = alloc,
+            .broker = broker,
+            .reg = reg,
+            .default_max_attempts = default_max_attempts,
+        };
     }
 
     fn errJson(self: *Rest, code: u16, msg: []const u8) ![]u8 {
@@ -39,9 +65,16 @@ pub const Rest = struct {
         return out.toOwnedSlice();
     }
 
-    fn maskedArgs(self: *Rest, args: []const u8, sensitive: bool) ![]u8 {
-        if (!sensitive) return try self.alloc.dupe(u8, args);
-        return try self.alloc.dupe(u8, "\"***\"");
+    /// Redact the kind's sensitive fields before the payload leaves the
+    /// process. A kind this process does not know is passed through: the
+    /// worker tier owns that kind's schema and its sensitive fields.
+    fn maskedArgs(self: *Rest, args: []const u8, kind: []const u8) ![]u8 {
+        if (self.reg) |reg| {
+            if (reg.get(kind)) |entry| {
+                return entry.masker(self.alloc, args) catch try self.alloc.dupe(u8, args);
+            }
+        }
+        return try self.alloc.dupe(u8, args);
     }
 
     /// GET /api/queues — depth per queue. `names` is the configured queue list.
@@ -130,7 +163,7 @@ pub const Rest = struct {
             defer self.alloc.free(q);
             const k = try self.escapeJson(r.kind);
             defer self.alloc.free(k);
-            const args = try self.maskedArgs(r.args_json, false);
+            const args = try self.maskedArgs(r.args_json, r.kind);
             defer self.alloc.free(args);
             const wid = try self.escapeJson(r.worker_id);
             defer self.alloc.free(wid);
@@ -161,7 +194,7 @@ pub const Rest = struct {
         defer self.alloc.free(q);
         const k = try self.escapeJson(r.kind);
         defer self.alloc.free(k);
-        const args = try self.maskedArgs(r.args_json, false);
+        const args = try self.maskedArgs(r.args_json, r.kind);
         defer self.alloc.free(args);
         const wid = try self.escapeJson(r.worker_id);
         defer self.alloc.free(wid);
@@ -172,7 +205,7 @@ pub const Rest = struct {
             if (i > 0) try w.writeAll(",");
             const t = try self.escapeJson(e.event_type);
             defer self.alloc.free(t);
-            const d = try self.maskedArgs(e.data_json, false);
+            const d = try self.maskedArgs(e.data_json, r.kind);
             defer self.alloc.free(d);
             try w.print("{{\"seq\":{d},\"type\":\"{s}\",\"data\":{s},\"at_ms\":{d}}}", .{ e.seq, t, d, e.at_ms });
         }
@@ -210,6 +243,12 @@ pub const Rest = struct {
 
     /// POST /api/enqueue — body: {"kind":..,"queue":..,"args":{...},"run_at_ms":..,"unique_key":..}
     /// Returns 409 when a uniqueness guard dedupes the request.
+    ///
+    /// When this process knows the kind, the payload is validated against the
+    /// kind's own schema before the job is stored, so an operator cannot
+    /// enqueue a payload the worker would dead-letter on its first attempt.
+    /// A kind this process does not know is accepted as-is: the worker tier
+    /// owns the schema.
     pub fn enqueue(self: *Rest, body: []const u8) ![]u8 {
         const parsed = std.json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch {
             return self.errJson(400, "bad_json");
@@ -224,10 +263,6 @@ pub const Rest = struct {
             .string => |s| s,
             else => return self.errJson(400, "bad_kind"),
         };
-        const queue: []const u8 = if (obj.get("queue")) |qv| switch (qv) {
-            .string => |s| s,
-            else => "default",
-        } else "default";
         var args_buf: [8192]u8 = undefined;
         var args_fbs = std.io.fixedBufferStream(&args_buf);
         if (obj.get("args")) |av| {
@@ -235,6 +270,25 @@ pub const Rest = struct {
         } else {
             try args_fbs.writer().writeAll("{}");
         }
+        const args_json = args_fbs.getWritten();
+
+        // Per-kind defaults: the kind's own queue and attempt budget.
+        var kind_queue: []const u8 = "default";
+        var max_attempts: u32 = self.default_max_attempts;
+        if (self.reg) |reg| {
+            if (reg.get(kind)) |entry| {
+                kind_queue = entry.queue;
+                max_attempts = entry.max_attempts;
+                entry.validator(self.alloc, args_json) catch {
+                    return self.errJson(400, "bad_args");
+                };
+            }
+        }
+
+        const queue: []const u8 = if (obj.get("queue")) |qv| switch (qv) {
+            .string => |s| s,
+            else => kind_queue,
+        } else kind_queue;
         const run_at: i64 = if (obj.get("run_at_ms")) |rv| switch (rv) {
             .integer => |n| n,
             else => 0,
@@ -245,7 +299,12 @@ pub const Rest = struct {
         } else null;
 
         var enq = broker_mod.Enqueued{};
-        self.broker.enqueue(kind, args_fbs.getWritten(), .{ .queue = queue, .run_at_ms = run_at, .unique_key = unique }, &enq) catch |e| {
+        self.broker.enqueue(kind, args_json, .{
+            .queue = queue,
+            .run_at_ms = run_at,
+            .max_attempts = max_attempts,
+            .unique_key = unique,
+        }, &enq) catch |e| {
             return self.errJson(500, @errorName(e));
         };
         if (enq.deduped) {
@@ -377,4 +436,162 @@ test "rest enqueue parses body" {
     const bad = try rest.enqueue("not json");
     defer std.testing.allocator.free(bad);
     try std.testing.expect(std.mem.indexOf(u8, bad, "\"code\":400") != null);
+}
+
+const TestArgs = struct { to: []const u8, subject: []const u8 };
+const TestError = error{ Transient, Permanent };
+
+const test_kind = job_mod.Kind(TestArgs, TestError).new(.{
+    .name = "emails.send",
+    .queue = "mailers",
+    .max_attempts = 7,
+    .sensitive = &.{"subject"},
+    .errors = .{ .retryable = &.{error.Transient}, .dead_on = &.{error.Permanent} },
+    .handle = struct {
+        fn run(_: *job_mod.Context, _: TestArgs) TestError!void {}
+    }.run,
+});
+
+test "rest rejects an enqueue whose payload does not fit the kind" {
+    const Mock = struct {
+        fn enqueueCb(_: *anyopaque, _: []const u8, _: []const u8, _: broker_mod.EnqueueOptions, _: *broker_mod.Enqueued) anyerror!void {
+            return error.Unsupported;
+        }
+        fn depthCb(_: *anyopaque, _: []const u8, _: *broker_mod.Depth) anyerror!void {
+            return error.Unsupported;
+        }
+        fn capabilitiesCb() broker_mod.Capabilities {
+            return .{ .transactional_enqueue = false, .pubsub_wakeups = false, .named_backend = "mock" };
+        }
+        fn deinitCb(_: *anyopaque) void {}
+        fn unsupportedClaim(_: *anyopaque, _: []const u8, _: u32, _: []const u8, _: u64, _: []broker_mod.Claimed) anyerror!usize {
+            return error.Unsupported;
+        }
+        fn unsupportedHeartbeat(_: *anyopaque, _: []const u8, _: []const i64, _: []const u64, _: u64) anyerror!void {
+            return error.Unsupported;
+        }
+        fn unsupportedFinish(_: *anyopaque, _: []const u8, _: i64, _: u64) anyerror!void {
+            return error.Unsupported;
+        }
+        fn unsupportedFail(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: bool, _: i64, _: *broker_mod.FailOutcome) anyerror!void {
+            return error.Unsupported;
+        }
+        fn unsupportedCancel(_: *anyopaque, _: []const u8, _: i64, _: ?u64) anyerror!void {
+            return error.Unsupported;
+        }
+        fn unsupportedPromote(_: *anyopaque, _: []const []const u8, _: u32) anyerror!u32 {
+            return error.Unsupported;
+        }
+        fn unsupportedReap(_: *anyopaque, _: []const []const u8, _: u32) anyerror!u32 {
+            return error.Unsupported;
+        }
+        const vt = broker_mod.VTable{
+            .enqueue = enqueueCb,
+            .claim = unsupportedClaim,
+            .heartbeat = unsupportedHeartbeat,
+            .finish = unsupportedFinish,
+            .fail = unsupportedFail,
+            .cancel = unsupportedCancel,
+            .promote = unsupportedPromote,
+            .reap = unsupportedReap,
+            .depth = depthCb,
+            .capabilities = capabilitiesCb,
+            .deinit = deinitCb,
+        };
+    };
+    var m: u8 = 0;
+    const br = broker_mod.Broker{ .ptr = &m, .vtable = &Mock.vt };
+
+    var reg = registry_mod.Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    try reg.register(registry_mod.entryFor(@TypeOf(test_kind), test_kind));
+
+    var rest = Rest.initWithKinds(std.testing.allocator, br, &reg, 25);
+
+    // The payload is missing "subject": the worker could never run it.
+    const bad = try rest.enqueue("{\"kind\":\"emails.send\",\"args\":{\"to\":\"a\"}}");
+    defer std.testing.allocator.free(bad);
+    try std.testing.expect(std.mem.indexOf(u8, bad, "\"code\":400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad, "bad_args") != null);
+
+    // An unknown field is just as unrunnable.
+    const extra = try rest.enqueue("{\"kind\":\"emails.send\",\"args\":{\"to\":\"a\",\"subject\":\"s\",\"x\":1}}");
+    defer std.testing.allocator.free(extra);
+    try std.testing.expect(std.mem.indexOf(u8, extra, "\"code\":400") != null);
+
+    // A kind this process does not know is still accepted: the worker tier
+    // owns that kind's schema.
+    const unknown = try rest.enqueue("{\"kind\":\"other.kind\",\"args\":{\"whatever\":1}}");
+    defer std.testing.allocator.free(unknown);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "\"code\":500") != null);
+}
+
+test "rest uses the kind's own queue and attempt budget" {
+    const Mock = struct {
+        var seen_queue: [64]u8 = undefined;
+        var seen_len: usize = 0;
+        var seen_max_attempts: u32 = 0;
+
+        fn enqueueCb(_: *anyopaque, _: []const u8, _: []const u8, opts: broker_mod.EnqueueOptions, out: *broker_mod.Enqueued) anyerror!void {
+            seen_len = opts.queue.len;
+            @memcpy(seen_queue[0..opts.queue.len], opts.queue);
+            seen_max_attempts = opts.max_attempts;
+            out.* = .{ .id = 7 };
+        }
+        fn depthCb(_: *anyopaque, _: []const u8, _: *broker_mod.Depth) anyerror!void {
+            return error.Unsupported;
+        }
+        fn capabilitiesCb() broker_mod.Capabilities {
+            return .{ .transactional_enqueue = false, .pubsub_wakeups = false, .named_backend = "mock" };
+        }
+        fn deinitCb(_: *anyopaque) void {}
+        fn unsupportedClaim(_: *anyopaque, _: []const u8, _: u32, _: []const u8, _: u64, _: []broker_mod.Claimed) anyerror!usize {
+            return error.Unsupported;
+        }
+        fn unsupportedHeartbeat(_: *anyopaque, _: []const u8, _: []const i64, _: []const u64, _: u64) anyerror!void {
+            return error.Unsupported;
+        }
+        fn unsupportedFinish(_: *anyopaque, _: []const u8, _: i64, _: u64) anyerror!void {
+            return error.Unsupported;
+        }
+        fn unsupportedFail(_: *anyopaque, _: []const u8, _: i64, _: u64, _: []const u8, _: bool, _: i64, _: *broker_mod.FailOutcome) anyerror!void {
+            return error.Unsupported;
+        }
+        fn unsupportedCancel(_: *anyopaque, _: []const u8, _: i64, _: ?u64) anyerror!void {
+            return error.Unsupported;
+        }
+        fn unsupportedPromote(_: *anyopaque, _: []const []const u8, _: u32) anyerror!u32 {
+            return error.Unsupported;
+        }
+        fn unsupportedReap(_: *anyopaque, _: []const []const u8, _: u32) anyerror!u32 {
+            return error.Unsupported;
+        }
+        const vt = broker_mod.VTable{
+            .enqueue = enqueueCb,
+            .claim = unsupportedClaim,
+            .heartbeat = unsupportedHeartbeat,
+            .finish = unsupportedFinish,
+            .fail = unsupportedFail,
+            .cancel = unsupportedCancel,
+            .promote = unsupportedPromote,
+            .reap = unsupportedReap,
+            .depth = depthCb,
+            .capabilities = capabilitiesCb,
+            .deinit = deinitCb,
+        };
+    };
+    var m: u8 = 0;
+    const br = broker_mod.Broker{ .ptr = &m, .vtable = &Mock.vt };
+
+    var reg = registry_mod.Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    try reg.register(registry_mod.entryFor(@TypeOf(test_kind), test_kind));
+
+    var rest = Rest.initWithKinds(std.testing.allocator, br, &reg, 25);
+    const s = try rest.enqueue("{\"kind\":\"emails.send\",\"args\":{\"to\":\"a\",\"subject\":\"s\"}}");
+    defer std.testing.allocator.free(s);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"id\":7") != null);
+
+    try std.testing.expectEqualStrings("mailers", Mock.seen_queue[0..Mock.seen_len]);
+    try std.testing.expectEqual(@as(u32, 7), Mock.seen_max_attempts);
 }

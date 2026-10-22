@@ -62,6 +62,15 @@ job id alone is ambiguous (Redis mode keys jobs per queue).
 { "kind": "emails.send", "args": { "to": "a@b.test", "subject": "hi" }, "queue": "mailers" }
 ```
 
+`args` must fit the kind's payload schema. When the dashboard process knows
+the kind, the payload is validated before the job is stored and a mismatch is
+rejected with `400 bad_args`, because the worker could never run it. A kind
+the dashboard does not know is accepted: the worker tier owns that kind's
+schema.
+
+When the kind is known, its own `queue` and `max_attempts` are used unless
+the request overrides the queue.
+
 ### Schedules
 
 | Method | Path | Description |

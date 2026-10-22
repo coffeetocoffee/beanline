@@ -4,6 +4,7 @@ const broker_mod = @import("../broker/broker.zig");
 const auth_mod = @import("auth.zig");
 const rest_mod = @import("rest.zig");
 const sse_mod = @import("sse.zig");
+const registry_mod = @import("../core/registry.zig");
 const metrics_mod = @import("../obs/metrics.zig");
 const logs_mod = @import("../obs/logs.zig");
 
@@ -50,11 +51,47 @@ pub const Server = struct {
         readonly: bool,
         secure_cookies: bool,
     ) Server {
+        return initWithKinds(
+            alloc,
+            broker,
+            auth,
+            bus,
+            metrics,
+            log,
+            queue_names,
+            bind,
+            readonly,
+            secure_cookies,
+            null,
+            25,
+        );
+    }
+
+    /// Build a server that knows the registered kinds, so the REST layer can
+    /// validate enqueues against the kind's schema and redact its sensitive
+    /// fields.
+    pub fn initWithKinds(
+        alloc: std.mem.Allocator,
+        broker: broker_mod.Broker,
+        auth: *auth_mod.Auth,
+        bus: *sse_mod.Bus,
+        metrics: *metrics_mod.Metrics,
+        log: *logs_mod.Logger,
+        queue_names: []const []const u8,
+        bind: []const u8,
+        readonly: bool,
+        secure_cookies: bool,
+        reg: ?*const registry_mod.Registry,
+        default_max_attempts: u32,
+    ) Server {
         return .{
             .alloc = alloc,
             .broker = broker,
             .auth = auth,
-            .rest = rest_mod.Rest.init(alloc, broker),
+            .rest = if (reg) |r|
+                rest_mod.Rest.initWithKinds(alloc, broker, r, default_max_attempts)
+            else
+                rest_mod.Rest.init(alloc, broker),
             .bus = bus,
             .metrics = metrics,
             .log = log,

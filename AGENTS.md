@@ -1,16 +1,47 @@
 # beanline — agent notes
 
 Zig 0.14.1 job queue (Postgres/Redis broker, cron scheduler, dashboard). Tests
-live inline in `src/`; `zig build test` = 137 unit + 10 fuzz (`tests/fuzz/all.zig`).
-Shared contract suite (tests/contract/all.zig): 56 cases run identically against
+live inline in `src/`; `zig build test` = 146 unit + fuzz-target tests
+(`tests/fuzz/all.zig`).
+Shared contract suite (tests/contract/all.zig): 60 cases run identically against
 both backends; `zig build test-contract` (needs BEANLINE_TEST_DSN /
 BEANLINE_TEST_REDIS_URL).
+
+## Kind API (changed in 0.8.0)
+
+A kind declares its own payload type and its own error set. There is no
+global `Args` struct and no runtime error-name matching any more.
+
+```zig
+const send_email = beanline.Kind(SendArgs, SendError).new(.{
+    .name = "emails.send",
+    .errors = .{ .retryable = &.{error.SmtpTransient}, .dead_on = &.{error.AddressInvalid} },
+    .handle = struct {
+        fn run(ctx: *beanline.JobContext, a: SendArgs) SendError!void { ... }
+    }.run,
+});
+try app.register(send_email);
+```
+
+- `Kind.new` is comptime-evaluated and runs the partition check, so an
+  unclassified error is a compile error.
+- The spec must be comptime-known. `Kind.new` takes a `comptime` parameter,
+  so a spec built at runtime does not compile (by design: a kind's schema,
+  policy and handler are compile-time facts).
+- The runtime never parses a payload and never matches an error name: the
+  kind's `runner` does both, with the classification baked in.
+- A payload that does not fit the schema is `BadPayload`, classified dead on
+  the first attempt.
+
+Do not reintroduce a shared payload struct or a name-based error list. Both
+were the reason the queue could only run one payload shape and why every
+error was retryable.
 
 ## Commands
 
 ```
 zig build -Doptimize=ReleaseSafe   # build
-zig build test                     # 140 tests (Linux/Windows only, see below)
+zig build test                     # 146 tests (Linux/Windows only, see below)
 zig build test-unit-probe          # installs zig-out/bin/test, run it directly
 zig build test-fuzz-install        # installs zig-out/bin/test-fuzz-tests
 zig build fuzz-gate                # 3 fuzz targets, 20k iters each

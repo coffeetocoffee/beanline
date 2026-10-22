@@ -7,6 +7,10 @@ A job queue and background worker system in Zig. One binary, two backends
 
 - **Transactional enqueue** in Postgres mode: enqueue inside your transaction,
   so "the row changed and the job exists" is atomic. No dual-write bug class.
+- **Per-kind payload schemas and retry policy**: every kind declares its own
+  argument type and its own error set. The payload is validated at
+  deserialization, and the retry classification is checked by the compiler, so
+  an unclassified error is a build error rather than a 3 a.m. retry storm.
 - **Reliable execution**: leases, heartbeats, fencing tokens, retries with
   backoff and jitter, dead letters, cancellation, graceful shutdown.
 - **Cron scheduler**: timezone aware, DST correct, misfire policies, leader
@@ -65,25 +69,44 @@ beanline bench [options]            workload generator and benchmark gate
 
 ## Embedding
 
+Each kind declares its own payload type and its own error set, so the payload
+schema and the retry classification are compile-time facts.
+
 ```zig
 const beanline = @import("beanline");
+
+const SendArgs = struct { to: []const u8, subject: []const u8 };
+const SendError = error{ SmtpTransient, AddressInvalid };
+
+const send_email = beanline.Kind(SendArgs, SendError).new(.{
+    .name = "emails.send",
+    .queue = "mailers",
+    // Every error the handler can return must land in exactly one class.
+    // Forget one and the build fails, instead of the queue burning its whole
+    // attempt budget on a permanent failure.
+    .errors = .{
+        .retryable = &.{ error.SmtpTransient },
+        .dead_on = &.{ error.AddressInvalid },
+    },
+    .handle = struct {
+        fn run(ctx: *beanline.JobContext, a: SendArgs) SendError!void {
+            _ = ctx;
+            _ = a;
+        }
+    }.run,
+});
 
 pub fn main(alloc: std.mem.Allocator) !u8 {
     var app = try beanline.App.init(alloc);
     defer app.deinit();
-    try app.register(.{
-        .name = "emails.send",
-        .queue = "mailers",
-        .handle = struct {
-            fn run(ctx: *beanline.JobContext, args: beanline.Args) !void {
-                _ = ctx;
-                _ = args;
-            }
-        }.run,
-    });
+    try app.register(send_email);
     return app.run();
 }
 ```
+
+Two kinds with different payload shapes run side by side. A payload that does
+not fit its kind's schema is a permanent failure: the job dead-letters on its
+first attempt instead of being retried until the attempt budget runs out.
 
 ## Configuration
 
