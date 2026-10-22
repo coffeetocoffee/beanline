@@ -1,7 +1,7 @@
 const std = @import("std");
 const cli = @import("cli/main.zig");
 
-pub const version = std.SemanticVersion{ .major = 0, .minor = 8, .patch = 1 };
+pub const version = std.SemanticVersion{ .major = 0, .minor = 9, .patch = 0 };
 
 /// A registered job kind. Generic over the payload type and the handler's
 /// error set: `beanline.Kind(Args, ErrorSet).new(.{ ... })`.
