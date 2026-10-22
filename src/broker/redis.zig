@@ -95,6 +95,7 @@ const Redis = struct {
             opts.unique_key orelse "",
             opts.dedup_run_id orelse "",
             opts.context_json,
+            try std.fmt.allocPrint(al, "{d}", .{opts.max_lease_losses}),
         };
         const v = try self.c.eval(al, enqueue_lua, &.{}, &argv);
         const items = switch (v) {
@@ -456,6 +457,11 @@ fn rowFromHash(alloc: std.mem.Allocator, qname: []const u8, id: i64, fields: []c
         .run_at_ms = parseI64(hashGet(fields, "run_at")),
         .attempts = @intCast(@max(0, parseI64(hashGet(fields, "attempts")))),
         .max_attempts = @intCast(@max(0, parseI64(hashGet(fields, "max_attempts")))),
+        // Jobs enqueued before the lease-loss counter existed have no
+        // max_lease_losses field; fall back to the default so they are
+        // still bounded.
+        .lease_losses = @intCast(@max(0, parseI64(hashGet(fields, "lease_losses") orelse "0"))),
+        .max_lease_losses = @intCast(@max(0, parseI64(hashGet(fields, "max_lease_losses") orelse "3"))),
         .lease_epoch = @intCast(@max(0, parseI64(hashGet(fields, "epoch")))),
         .worker_id = try alloc.dupe(u8, hashGet(fields, "worker") orelse ""),
         .inserted_ms = parseI64(hashGet(fields, "inserted_at")),
@@ -606,7 +612,7 @@ const redis_retry_lua =
     \\local jk = prefix .. ':job:' .. ARGV[2]
     \\local st = redis.call('HGET', jk, 'status')
     \\if st ~= 'dead' and st ~= 'cancelled' then return 0 end
-    \\redis.call('HSET', jk, 'status', 'available', 'run_at', ARGV[3], 'attempts', '0')
+    \\redis.call('HSET', jk, 'status', 'available', 'run_at', ARGV[3], 'attempts', '0', 'lease_losses', '0')
     \\redis.call('DEL', prefix .. ':lease:' .. ARGV[2])
     \\redis.call('ZREM', prefix .. ':expires', ARGV[2])
     \\redis.call('LPUSH', prefix .. ':ready:' .. (redis.call('HGET', jk, 'priority') or '1'), ARGV[2])

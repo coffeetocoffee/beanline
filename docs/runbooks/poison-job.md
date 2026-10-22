@@ -4,7 +4,8 @@
 
 - One job id recurs in the dashboard with the same error on every attempt.
 - One handler burns its whole retry budget per job and blocks queue throughput.
-- Sandbox kinds reach `crash_loop` dead jobs (`reason = "crash_loop"`).
+- One job id repeats with `claimed` and `reaped` events and no completion:
+  the handler kills its worker, so the lease is lost every time.
 - A queue shows steady failing throughput with no successful completions.
 
 A poison job is one specific job (bad args, unparseable payload) or one kind
@@ -27,11 +28,17 @@ stop the bleeding, preserve the evidence, quarantine, then replay later.
    curl -s -H "Authorization: Bearer $KEY" 127.0.0.1:9484/api/jobs/12345
    ```
 
-3. **Are args sensitive?** Fields marked `sensitive` render as `***`. If you need
+3. **Did the worker die, or did the handler fail?** The event trail
+   distinguishes them. A handler that returned an error leaves an
+   `attempt_failed` (or `dead`) event. A handler that killed its worker
+   leaves a `reaped` event, and the job's `attempts` count stays flat while
+   `lease_losses` climbs.
+
+4. **Are args sensitive?** Fields marked `sensitive` render as `***`. If you need
    the values to diagnose, get them from the producer side instead of disabling
    masking; that is a disclosure event and must be logged as one.
 
-4. **Does it repeat after cancellation?** Cancel it first (see below). If a new
+5. **Does it repeat after cancellation?** Cancel it first (see below). If a new
    job with the same args arrives, this is a producer bug, not a queue problem.
 
 ## Contain: stop the retry burn
@@ -63,24 +70,43 @@ Options, safest first:
 3. **Discard the job** once the evidence is captured and it cannot ever succeed.
    This is terminal; the event log keeps the record.
 
-4. **Cap the damage with the budget.** If a poison job is enqueued at high rate
-   (a retrying producer), lower `max_attempts` for the kind and pause the queue
-   until the producer is fixed. Every retry costs real handler time.
+4. **Cap the damage with the budget.** `max_attempts` is set per job when it
+   is enqueued, so a producer that keeps re-enqueueing the same payload is the
+   thing to fix: give it a lower `max_attempts` (or stop re-enqueueing) and
+   pause the queue until the producer is fixed. Every retry costs real handler
+   time.
 
-## Quarantine a crashing kind
+## Quarantine a kind that kills its worker
 
-For kinds run with `isolation = "subprocess"`, a crash is already isolated:
-the supervisor releases the job with reason `worker_crash`, and
-`max_crash_attempts` stops the loop and parks the job as `crash_loop`. Actions:
+A segfault, an OOM kill, or a Zig panic in a handler takes the whole worker
+process down: there is no in-process crash isolation. The jobs that worker
+was holding lose their leases, the reaper requeues them, and the attempt the
+reaper consumed is refunded, because a lease expiry is usually not the job's
+fault (the worker died, the host rebooted, the heartbeat was lost).
 
-1. Keep the kind isolated; do not move it in-process to "fix" the symptom.
-2. Capture the failing job id and its args.
-3. Replay into a staging queue after the fix rather than into production.
+The consequence is that a job whose handler kills the worker on every attempt
+never spends an attempt, so `max_attempts` never dead-letters it. The
+separate `lease_losses` counter is the bound: it is never refunded, and once a
+job has lost `max_lease_losses` leases (default 3) it is dead-lettered and
+appears in the dead list. Actions:
+
+1. Pause the queue if the crashing kind has the queue to itself. A worker
+   restart loop takes every other job on that worker down with it.
+2. Confirm the loop from the job's event trail: a repeated `claimed` /
+   `reaped` alternation with a flat `attempts` count and a climbing
+   `lease_losses` count.
+3. Capture the failing job id and its args.
+4. Fix the handler before unpausing. Replay into a staging queue after the fix
+   rather than into production.
+
+There is no per-kind crash isolation in this release, so the handler has to be
+fixed in place. The lease-loss bound stops the job from churning forever; it
+does not stop the worker from restarting until the handler is fixed.
 
 ## Evidence to keep before discarding
 
-- Job id, kind, queue, attempt count.
-- Full event trail (`enqueued`, each `attempt_failed`, `dead`).
+- Job id, kind, queue, attempt count, lease loss count.
+- Full event trail (`enqueued`, each `attempt_failed`, each `reaped`, `dead`).
 - Args, with sensitive fields left masked in any shared report.
 - The deploy or config change that correlates in time with the first failure.
 
@@ -100,6 +126,7 @@ the supervisor releases the job with reason `worker_crash`, and
 - Successful completions for that kind resume.
 - The producer no longer enqueues the bad payload (check for a new poison job
   within a few minutes of traffic).
+- No job is left cycling with `lease_losses` climbing.
 
 ## Escalate when
 
@@ -108,6 +135,6 @@ the supervisor releases the job with reason `worker_crash`, and
 - Discarding is not acceptable because the work is regulated or billable: keep
   the job in `dead`, notify the data owner, and schedule the replay with the
   business owner.
-- A handler segfaults or OOMs outside sandbox mode: the worker process is at
-  risk. Restart the worker and move that kind to `isolation = "subprocess"`
-  before resuming the queue.
+- A handler segfaults or OOMs: the worker process dies with it, and every
+  other job it was holding is requeued. Restart the worker, fix the handler,
+  and only then resume the queue.

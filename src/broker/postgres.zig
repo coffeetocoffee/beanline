@@ -3,10 +3,10 @@ const b = @import("broker.zig");
 const pg = @import("pg/conn.zig");
 
 const SQL_INSERT_UNIQUE =
-    \\INSERT INTO beanline_jobs (queue, kind, args, priority, run_at, max_attempts, unique_key, dedup_run_id, context, status)
+    \\INSERT INTO beanline_jobs (queue, kind, args, priority, run_at, max_attempts, max_lease_losses, unique_key, dedup_run_id, context, status)
     \\VALUES ($1, $2, $3::jsonb, $4,
     \\  CASE WHEN $5::bigint = 0 THEN now() ELSE to_timestamp($5::bigint::double precision / 1000.0) END,
-    \\  $6::int, $7, $8, $9::jsonb,
+    \\  $6::int, $7::int, $8, $9, $10::jsonb,
     \\  CASE WHEN $5::bigint <> 0 AND to_timestamp($5::bigint::double precision / 1000.0) > now()
     \\       THEN 'scheduled' ELSE 'available' END)
     \\ON CONFLICT (queue, kind, unique_key) WHERE unique_key IS NOT NULL AND status NOT IN ('completed','discarded','cancelled','dead')
@@ -15,10 +15,10 @@ const SQL_INSERT_UNIQUE =
 ;
 
 const SQL_INSERT_DEDUP =
-    \\INSERT INTO beanline_jobs (queue, kind, args, priority, run_at, max_attempts, unique_key, dedup_run_id, context, status)
+    \\INSERT INTO beanline_jobs (queue, kind, args, priority, run_at, max_attempts, max_lease_losses, unique_key, dedup_run_id, context, status)
     \\VALUES ($1, $2, $3::jsonb, $4,
     \\  CASE WHEN $5::bigint = 0 THEN now() ELSE to_timestamp($5::bigint::double precision / 1000.0) END,
-    \\  $6::int, $7, $8, $9::jsonb,
+    \\  $6::int, $7::int, $8, $9, $10::jsonb,
     \\  CASE WHEN $5::bigint <> 0 AND to_timestamp($5::bigint::double precision / 1000.0) > now()
     \\       THEN 'scheduled' ELSE 'available' END)
     \\ON CONFLICT (kind, dedup_run_id) WHERE dedup_run_id IS NOT NULL
@@ -118,20 +118,36 @@ const SQL_PROMOTE =
     \\RETURNING j.id
 ;
 
+// A lease expiry is refunded: the attempt is given back because a lease
+// expiry is usually not the job's fault (worker killed, host reboot, VM
+// paused, heartbeat lost). lease_losses counts the expiries separately and
+// is never refunded, so a job whose handler kills its worker on every
+// attempt is dead-lettered once it has lost max_lease_losses leases even
+// though it never spent an attempt.
 const SQL_REAP =
     \\WITH exp AS (
-    \\  SELECT id, attempts, max_attempts FROM beanline_jobs
+    \\  SELECT id, attempts, max_attempts, lease_losses, max_lease_losses FROM beanline_jobs
     \\  WHERE status = 'running' AND lock_expires_at < now()
     \\  ORDER BY lock_expires_at
     \\  FOR UPDATE SKIP LOCKED
     \\  LIMIT $1
+    \\), upd AS (
+    \\  SELECT id, attempts AS attempts_before, lease_losses + 1 AS lease_losses_after,
+    \\    CASE WHEN attempts >= max_attempts
+    \\           OR (max_lease_losses > 0 AND lease_losses + 1 >= max_lease_losses)
+    \\         THEN 'dead' ELSE 'available' END AS new_status,
+    \\    CASE WHEN attempts >= max_attempts
+    \\           OR (max_lease_losses > 0 AND lease_losses + 1 >= max_lease_losses)
+    \\         THEN attempts ELSE greatest(attempts - 1, 0) END AS new_attempts
+    \\  FROM exp
     \\)
     \\UPDATE beanline_jobs j SET
-    \\  status = CASE WHEN e.attempts >= e.max_attempts THEN 'dead' ELSE 'available' END,
-    \\  attempts = CASE WHEN e.attempts >= e.max_attempts THEN e.attempts ELSE greatest(e.attempts - 1, 0) END,
+    \\  status = u.new_status,
+    \\  attempts = u.new_attempts,
+    \\  lease_losses = u.lease_losses_after,
     \\  lock_expires_at = NULL
-    \\FROM exp e WHERE j.id = e.id
-    \\RETURNING j.id, j.status, j.attempts
+    \\FROM upd u WHERE j.id = u.id
+    \\RETURNING j.id, j.status, u.attempts_before, j.lease_losses
 ;
 
 const SQL_DEPTH =
@@ -397,9 +413,13 @@ const Pg = struct {
             for (rows.rows) |row| {
                 const id = try Pg.intCell(i64, row, 0);
                 const status_s = try textCell(row, 1);
+                // attempts_before is the attempt count the job had when the
+                // lease expired; the reaper refunds it unless the job is
+                // dead-lettered. lease_losses is the count after this reap.
                 const attempts = try Pg.intCell(u32, row, 2);
-                var evbuf: [160]u8 = undefined;
-                const evdata = try std.fmt.bufPrint(&evbuf, "{{\"status\":\"{s}\",\"attempts\":{d}}}", .{ status_s, attempts });
+                const lease_losses = try Pg.intCell(u32, row, 3);
+                var evbuf: [192]u8 = undefined;
+                const evdata = try std.fmt.bufPrint(&evbuf, "{{\"status\":\"{s}\",\"attempts\":{d},\"lease_losses\":{d}}}", .{ status_s, attempts, lease_losses });
                 try self.insertEvent(id, "reaped", evdata);
             }
         }
@@ -503,7 +523,7 @@ fn deinitCb(ctx: *anyopaque) void {
 const SQL_LIST_BASE =
     \\SELECT id, queue, kind, args::text, status, priority,
     \\       (extract(epoch from run_at) * 1000)::bigint,
-    \\        attempts, max_attempts, lease_epoch,
+    \\        attempts, max_attempts, lease_losses, max_lease_losses, lease_epoch,
     \\       coalesce(worker_id, ''),
     \\       (extract(epoch from inserted_at) * 1000)::bigint,
     \\       coalesce((extract(epoch from started_at) * 1000)::bigint, 0),
@@ -543,7 +563,7 @@ const SQL_QUEUE_PAUSED = "SELECT paused FROM beanline_queue_state WHERE queue = 
 // the same way, since a retried job does not re-acquire the guard.
 const SQL_RETRY =
     \\UPDATE beanline_jobs j SET status = 'available', run_at = now(),
-    \\  attempts = 0, lock_expires_at = NULL,
+    \\  attempts = 0, lease_losses = 0, lock_expires_at = NULL,
     \\  unique_key = CASE WHEN EXISTS (
     \\      SELECT 1 FROM beanline_jobs o
     \\      WHERE o.queue = j.queue AND o.kind = j.kind
@@ -572,11 +592,13 @@ fn rowToJobRow(row: []?[]const u8) !b.JobRow {
         .run_at_ms = try Pg.intCell(i64, row, 6),
         .attempts = try Pg.intCell(u32, row, 7),
         .max_attempts = try Pg.intCell(u32, row, 8),
-        .lease_epoch = try Pg.intCell(u64, row, 9),
-        .worker_id = try Pg.textCell(row, 10),
-        .inserted_ms = try Pg.intCell(i64, row, 11),
-        .started_ms = try Pg.intCell(i64, row, 12),
-        .finished_ms = try Pg.intCell(i64, row, 13),
+        .lease_losses = try Pg.intCell(u32, row, 9),
+        .max_lease_losses = try Pg.intCell(u32, row, 10),
+        .lease_epoch = try Pg.intCell(u64, row, 11),
+        .worker_id = try Pg.textCell(row, 12),
+        .inserted_ms = try Pg.intCell(i64, row, 13),
+        .started_ms = try Pg.intCell(i64, row, 14),
+        .finished_ms = try Pg.intCell(i64, row, 15),
     };
 }
 
@@ -634,6 +656,8 @@ fn listJobsImpl(self: *Pg, alloc: std.mem.Allocator, filter: b.JobFilter, out: *
             .run_at_ms = jr.run_at_ms,
             .attempts = jr.attempts,
             .max_attempts = jr.max_attempts,
+            .lease_losses = jr.lease_losses,
+            .max_lease_losses = jr.max_lease_losses,
             .lease_epoch = jr.lease_epoch,
             .worker_id = try ral.dupe(u8, jr.worker_id),
             .inserted_ms = jr.inserted_ms,
@@ -667,6 +691,8 @@ fn getJobImpl(self: *Pg, alloc: std.mem.Allocator, id: i64, out: *?b.JobRow) !vo
         .run_at_ms = jr.run_at_ms,
         .attempts = jr.attempts,
         .max_attempts = jr.max_attempts,
+        .lease_losses = jr.lease_losses,
+        .max_lease_losses = jr.max_lease_losses,
         .lease_epoch = jr.lease_epoch,
         .worker_id = try ral.dupe(u8, jr.worker_id),
         .inserted_ms = jr.inserted_ms,
@@ -816,11 +842,12 @@ fn insertEventOnConn(alloc: std.mem.Allocator, c: *pg.Conn, job_id: i64, event_t
 
 fn enqueueCore(alloc: std.mem.Allocator, c: *pg.Conn, kind: []const u8, args_json: []const u8, opts: b.EnqueueOptions, out: *b.Enqueued) !void {
     if (opts.unique == .replace) return error.UnsupportedUnique;
-    var pbuf: [3][24]u8 = undefined;
+    var pbuf: [4][24]u8 = undefined;
     const pri = try std.fmt.bufPrint(&pbuf[0], "{d}", .{opts.priority});
     const rat = try std.fmt.bufPrint(&pbuf[1], "{d}", .{opts.run_at_ms});
     const ma = try std.fmt.bufPrint(&pbuf[2], "{d}", .{opts.max_attempts});
-    const params = [_]?[]const u8{ opts.queue, kind, args_json, pri, rat, ma, opts.unique_key, opts.dedup_run_id, opts.context_json };
+    const mll = try std.fmt.bufPrint(&pbuf[3], "{d}", .{opts.max_lease_losses});
+    const params = [_]?[]const u8{ opts.queue, kind, args_json, pri, rat, ma, mll, opts.unique_key, opts.dedup_run_id, opts.context_json };
 
     const deduped_sql = opts.dedup_run_id != null;
     const maybe_id: ?i64 = blk: {

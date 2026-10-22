@@ -274,7 +274,13 @@ fn case_reap_requeues_expired(f: *Fixture) !void {
     const claimed = try f.claim(1);
     try std.testing.expectEqual(@as(usize, 1), claimed.len);
     try std.testing.expectEqual(enq.id, claimed[0].id);
+    // The attempt is refunded: a lease expiry is usually not the job's
+    // fault, so it must not spend the failure budget. The lease loss is
+    // counted separately and is not refunded.
     try std.testing.expectEqual(@as(u32, 1), claimed[0].attempts);
+    const row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(@as(u32, 1), row.lease_losses);
+    try std.testing.expectEqual(broker.Status.running, row.status);
 }
 
 fn case_reap_dead_when_exhausted(f: *Fixture) !void {
@@ -287,6 +293,97 @@ fn case_reap_dead_when_exhausted(f: *Fixture) !void {
     try std.testing.expectEqual(@as(u64, 1), d.dead);
     try std.testing.expectEqual(@as(u64, 0), d.available);
     _ = enq;
+}
+
+// A job whose handler kills its worker on every attempt never spends an
+// attempt, so max_attempts alone never dead-letters it: the attempt
+// counter is refunded on every reap. The lease-loss counter is the bound.
+fn case_reap_dead_after_lease_losses(f: *Fixture) !void {
+    const enq = try f.enqueue("ct.kind", "{}", .{
+        .queue = f.queue,
+        .max_attempts = 25,
+        .max_lease_losses = 2,
+    });
+
+    // First lease loss: requeued, attempt refunded, loss counted.
+    _ = try f.claimWith(1, "worker-a", 50);
+    std.time.sleep(200 * std.time.ns_per_ms);
+    try std.testing.expect((try f.reap(&.{f.queue}, 10)) >= 1);
+    var d = try f.depth();
+    try std.testing.expectEqual(@as(u64, 0), d.running);
+    try std.testing.expectEqual(@as(u64, 1), d.available);
+    try std.testing.expectEqual(@as(u64, 0), d.dead);
+    var row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.available, row.status);
+    try std.testing.expectEqual(@as(u32, 0), row.attempts);
+    try std.testing.expectEqual(@as(u32, 1), row.lease_losses);
+
+    // Second lease loss: dead-lettered even though no attempt was spent.
+    _ = try f.claimWith(1, "worker-a", 50);
+    std.time.sleep(200 * std.time.ns_per_ms);
+    _ = try f.reap(&.{f.queue}, 10);
+    d = try f.depth();
+    try std.testing.expectEqual(@as(u64, 0), d.available);
+    try std.testing.expectEqual(@as(u64, 0), d.running);
+    try std.testing.expectEqual(@as(u64, 1), d.dead);
+    row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.dead, row.status);
+    try std.testing.expectEqual(@as(u32, 2), row.lease_losses);
+    try std.testing.expectEqual(@as(u32, 2), row.max_lease_losses);
+}
+
+// max_lease_losses = 0 disables the bound: the job is requeued forever.
+fn case_reap_lease_loss_bound_disabled(f: *Fixture) !void {
+    const enq = try f.enqueue("ct.kind", "{}", .{
+        .queue = f.queue,
+        .max_attempts = 25,
+        .max_lease_losses = 0,
+    });
+
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        _ = try f.claimWith(1, "worker-a", 50);
+        std.time.sleep(200 * std.time.ns_per_ms);
+        _ = try f.reap(&.{f.queue}, 10);
+    }
+    const d = try f.depth();
+    try std.testing.expectEqual(@as(u64, 1), d.available);
+    try std.testing.expectEqual(@as(u64, 0), d.dead);
+    const row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.available, row.status);
+    try std.testing.expectEqual(@as(u32, 3), row.lease_losses);
+}
+
+// An operator replay starts the job with a fresh budget: the attempt count
+// and the lease loss count both go back to zero, otherwise a replayed job
+// would be one lease loss away from dead again.
+fn case_replay_resets_lease_losses(f: *Fixture) !void {
+    const enq = try f.enqueue("ct.kind", "{}", .{
+        .queue = f.queue,
+        .max_attempts = 25,
+        .max_lease_losses = 2,
+    });
+
+    // One loss short of the bound, then kill the job the hard way.
+    _ = try f.claimWith(1, "worker-a", 50);
+    std.time.sleep(200 * std.time.ns_per_ms);
+    _ = try f.reap(&.{f.queue}, 10);
+    var row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(@as(u32, 1), row.lease_losses);
+
+    // Dead-letter it so it can be replayed.
+    _ = try f.claimWith(1, "worker-a", 50);
+    std.time.sleep(200 * std.time.ns_per_ms);
+    _ = try f.reap(&.{f.queue}, 10);
+    row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.dead, row.status);
+    try std.testing.expectEqual(@as(u32, 2), row.lease_losses);
+
+    try f.retry(enq.id);
+    row = (try f.getJob(enq.id)).?;
+    try std.testing.expectEqual(broker.Status.available, row.status);
+    try std.testing.expectEqual(@as(u32, 0), row.attempts);
+    try std.testing.expectEqual(@as(u32, 0), row.lease_losses);
 }
 
 fn case_heartbeat_extends_lease(f: *Fixture) !void {
@@ -728,6 +825,9 @@ pub const contract_cases = [_]harness.Case{
     .{ .name = "operator-retry-dead", .queue = "retry-dead", .run = case_operator_retry_dead },
     .{ .name = "reap-requeues-expired", .queue = "reap-requeue", .run = case_reap_requeues_expired },
     .{ .name = "reap-dead-when-exhausted", .queue = "reap-dead", .run = case_reap_dead_when_exhausted },
+    .{ .name = "reap-dead-after-lease-losses", .queue = "reap-losses", .run = case_reap_dead_after_lease_losses },
+    .{ .name = "reap-lease-loss-bound-disabled", .queue = "reap-nolimit", .run = case_reap_lease_loss_bound_disabled },
+    .{ .name = "replay-resets-lease-losses", .queue = "replay-losses", .run = case_replay_resets_lease_losses },
     .{ .name = "heartbeat-extends-lease", .queue = "hb-extend", .run = case_heartbeat_extends_lease },
     .{ .name = "heartbeat-stale-epoch-noop", .queue = "hb-stale", .run = case_heartbeat_stale_epoch_noop },
     .{ .name = "unique-dedupes-pending", .queue = "uniq-pend", .run = case_unique_dedupes_pending },

@@ -54,6 +54,7 @@ end
 redis.call('HSET', jk,
   'queue', q, 'kind', kind, 'args', args, 'priority', prio,
   'status', status, 'attempts', '0', 'max_attempts', maxa, 'epoch', '0',
+  'lease_losses', '0', 'max_lease_losses', ARGV[10],
   'unique', uniq, 'dedup', dedup, 'run_at', tostring(run_at),
   'context', ARGV[9], 'inserted_at', tostring(now_ms))
 if status == 'available' then

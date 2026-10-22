@@ -385,9 +385,16 @@ RETURNING j.*;   -- includes the fresh lease_epoch (fencing token)
   for all running jobs of that worker (`WHERE lease_epoch = ANY(...)` via join),
   at `lease/3` intervals. This keeps heartbeat cost flat, not per-job-per-second.
 - The reaper (leader-elected, see 8.4) promotes any `running` job whose
-  `lock_expires_at < now()` back to `available` (or `dead` if attempts exhausted),
-  writing a `reaped` event. The reaped job gets a fresh epoch on next claim; any
+  `lock_expires_at < now()` back to `available` (or `dead` if attempts
+  exhausted), writing a `reaped` event. The reaped job gets a fresh epoch on next claim; any
   late writes from the zombie are fencing-rejected.
+- A lease expiry is refunded: the attempt is given back, because a lease
+  expiry is usually not the job's fault (worker killed, host rebooted, VM
+  paused, heartbeat lost). The refund alone leaves a hole: a job whose handler
+  kills its worker on every attempt never spends an attempt, so `max_attempts`
+  never dead-letters it. `lease_losses` counts the expiries separately and is
+  never refunded; once a job has lost `max_lease_losses` leases (default 3) it
+  is dead-lettered. `max_lease_losses = 0` disables the bound.
 - Boot reconciliation: on startup, a worker with a stable `worker_id` marks jobs
   where `worker_id = self AND lock_expires_at < now()` immediately rather than
   waiting for reaper cadence (fast crash-restart recovery).
@@ -633,6 +640,11 @@ the fencing/lease machinery handles the rest).
 
 ### 9.7 Sandbox mode (crash isolation, optional per kind)
 
+Not implemented in this release; the milestone table scopes it past 1.0. Until
+it exists, a handler that segfaults, is OOM-killed, or panics takes the worker
+process down, and the crash loop is bounded by the lease-loss counter
+described in 6.4 and 10.1 rather than by a supervisor observing the crash.
+
 `isolation = "subprocess"`: the executor forks a pre-spawned child (fork-on-
 demand pool, warmed to avoid fork cost on hot paths), serializes the job spec
 over a pipe, and the child re-execs the `beanline perform-one` hidden mode. Faults
@@ -650,9 +662,12 @@ untrusted code paths this exists for.
 
 - An attempt = one claim. Claims increment `attempts`. A job that never
   executes because a worker died between claim and start still consumed an
-  attempt; `no_attempt_on_lease_expiry = true` (default) refunds it, so
-  infrastructure flakiness does not burn budgets and crash loops are caught by
-  the separate `max_crash_attempts`.
+  attempt; the refund is unconditional in this release, so infrastructure
+  flakiness does not burn budgets.
+- Crash loops are caught by a separate counter that is never refunded:
+  `lease_losses`, bounded per job by `max_lease_losses` (default 3). The
+  sandbox's `max_crash_attempts` (section 9.7) is the same idea observed
+  from inside an isolated child, and is not implemented.
 
 ### 10.2 Backoff formula set
 
@@ -699,8 +714,11 @@ attempts on a permanent failure.
 ### 10.4 Dead letter queue
 
 - Dead jobs keep full error history (events: error, stack, payload, attempt
-  durations) and a machine-readable `dead_reason`
-  (`attempts_exhausted | non_retryable | crash_loop | discarded_by_operator`).
+  durations). A machine-readable `dead_reason`
+  (`attempts_exhausted | non_retryable | crash_loop | discarded_by_operator`) is
+  not implemented; the event trail carries the reason instead (a `dead` event
+  after `attempt_failed` is a handler error, a `dead` event after `reaped` is
+  the lease-loss bound, and the job row carries `attempts` and `lease_losses`).
 - Replay policies: manual (dashboard/CLI), scoped auto-replay
   (`dead.auto_replay_after` with bounded count), and replay-with-edited-args
   (dashboard JSON editor validates against the kind's arg struct before

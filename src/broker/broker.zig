@@ -31,6 +31,13 @@ pub const EnqueueOptions = struct {
     priority: u8 = 1,
     run_at_ms: i64 = 0,
     max_attempts: u32 = 25,
+    /// How many lease expiries the job tolerates before it is
+    /// dead-lettered. A lease expiry (worker killed, host reboot, heartbeat
+    /// lost) does not spend an attempt, so this is what bounds a job whose
+    /// handler kills its worker on every attempt: without it the attempt
+    /// counter never climbs and max_attempts is never reached. 0 disables
+    /// the bound and requeues the job forever.
+    max_lease_losses: u32 = 3,
     unique_key: ?[]const u8 = null,
     dedup_run_id: ?[]const u8 = null,
     tags: []const []const u8 = &.{},
@@ -93,6 +100,10 @@ pub const JobRow = struct {
     run_at_ms: i64,
     attempts: u32,
     max_attempts: u32,
+    /// Lease expiries so far. Never refunded, unlike `attempts`.
+    lease_losses: u32 = 0,
+    /// Lease expiries tolerated before the job is dead-lettered.
+    max_lease_losses: u32 = 0,
     lease_epoch: u64,
     worker_id: []const u8,
     inserted_ms: i64,

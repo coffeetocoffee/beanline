@@ -134,8 +134,8 @@ pub const Rest = struct {
             defer self.alloc.free(args);
             const wid = try self.escapeJson(r.worker_id);
             defer self.alloc.free(wid);
-            try w.print("{{\"id\":{d},\"queue\":\"{s}\",\"kind\":\"{s}\",\"args\":{s},\"status\":\"{s}\",\"priority\":{d},\"run_at_ms\":{d},\"attempts\":{d},\"max_attempts\":{d},\"lease_epoch\":{d},\"worker_id\":\"{s}\",\"inserted_ms\":{d},\"started_ms\":{d},\"finished_ms\":{d}}}", .{
-                r.id, q, k, args, @tagName(r.status), r.priority, r.run_at_ms, r.attempts, r.max_attempts, r.lease_epoch, wid, r.inserted_ms, r.started_ms, r.finished_ms,
+            try w.print("{{\"id\":{d},\"queue\":\"{s}\",\"kind\":\"{s}\",\"args\":{s},\"status\":\"{s}\",\"priority\":{d},\"run_at_ms\":{d},\"attempts\":{d},\"max_attempts\":{d},\"lease_losses\":{d},\"max_lease_losses\":{d},\"lease_epoch\":{d},\"worker_id\":\"{s}\",\"inserted_ms\":{d},\"started_ms\":{d},\"finished_ms\":{d}}}", .{
+                r.id, q, k, args, @tagName(r.status), r.priority, r.run_at_ms, r.attempts, r.max_attempts, r.lease_losses, r.max_lease_losses, r.lease_epoch, wid, r.inserted_ms, r.started_ms, r.finished_ms,
             });
         }
         try w.writeAll("]}");
@@ -165,8 +165,8 @@ pub const Rest = struct {
         defer self.alloc.free(args);
         const wid = try self.escapeJson(r.worker_id);
         defer self.alloc.free(wid);
-        try w.print("{{\"id\":{d},\"queue\":\"{s}\",\"kind\":\"{s}\",\"args\":{s},\"status\":\"{s}\",\"priority\":{d},\"run_at_ms\":{d},\"attempts\":{d},\"max_attempts\":{d},\"lease_epoch\":{d},\"worker_id\":\"{s}\",\"inserted_ms\":{d},\"started_ms\":{d},\"finished_ms\":{d},\"events\":[", .{
-            r.id, q, k, args, @tagName(r.status), r.priority, r.run_at_ms, r.attempts, r.max_attempts, r.lease_epoch, wid, r.inserted_ms, r.started_ms, r.finished_ms,
+        try w.print("{{\"id\":{d},\"queue\":\"{s}\",\"kind\":\"{s}\",\"args\":{s},\"status\":\"{s}\",\"priority\":{d},\"run_at_ms\":{d},\"attempts\":{d},\"max_attempts\":{d},\"lease_losses\":{d},\"max_lease_losses\":{d},\"lease_epoch\":{d},\"worker_id\":\"{s}\",\"inserted_ms\":{d},\"started_ms\":{d},\"finished_ms\":{d},\"events\":[", .{
+            r.id, q, k, args, @tagName(r.status), r.priority, r.run_at_ms, r.attempts, r.max_attempts, r.lease_losses, r.max_lease_losses, r.lease_epoch, wid, r.inserted_ms, r.started_ms, r.finished_ms,
         });
         for (evs.items, 0..) |e, i| {
             if (i > 0) try w.writeAll(",");

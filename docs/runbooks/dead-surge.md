@@ -22,13 +22,14 @@
    curl -s -H "Authorization: Bearer $KEY" 127.0.0.1:9484/api/jobs/12345
    ```
 
-3. **Which reason?** `dead_reason` is one of:
+3. **Which reason?** There is no `dead_reason` field. The event trail carries
+   the reason:
 
-   | Reason | Meaning |
+   | Last event | Meaning |
    |---|---|
-   | `attempts_exhausted` | Retried until `max_attempts`, then parked |
-   | `non_retryable` | Handler returned an error classified as permanently fatal |
-   | `crash_loop` | Sandbox subprocess crashed 3 times (`max_crash_attempts`) |
+   | `dead` after `attempt_failed` | The handler returned an error. The event carries `error` and `retryable`. |
+   | `dead` after `reaped` | The job lost `max_lease_losses` leases: the handler kept killing its worker. |
+   | `dead` after `claimed` | The job spent its `max_attempts` budget. |
    | `discarded_by_operator` | A human threw it away |
 
 ## Likely causes and actions
@@ -62,9 +63,11 @@ The kind's error set maps an error to retryable when it should be `dead_on`.
 Fix the mapping and rebuild; dead jobs that failed for this reason are safe to
 replay after the fix.
 
-### Crash loop (`crash_loop`)
+### A handler that kills its worker
 
-See [poison-job.md](poison-job.md).
+The job lost `max_lease_losses` leases (default 3): the handler segfaulted, was
+OOM-killed, or panicked, and the worker process died with it each time. See
+[poison-job.md](poison-job.md).
 
 ## Prevention
 

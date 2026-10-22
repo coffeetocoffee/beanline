@@ -85,8 +85,9 @@ curl -s -X POST -H "Authorization: Bearer $KEY" -H "x-csrf-token: $CSRF" \
 
 ### Reap loop from a crashing handler
 
-If reaps are followed by crashes and `crash_loop` dead jobs, that is a poison
-job, not a lease problem. Go to [poison-job.md](poison-job.md).
+If reaps are followed by worker restarts and jobs that die after losing
+`max_lease_losses` leases, that is a poison job, not a lease problem. Go to
+[poison-job.md](poison-job.md).
 
 ## Verification
 
