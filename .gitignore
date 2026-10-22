@@ -7,6 +7,13 @@ dist/
 worker_err.txt
 worker_out.txt
 
+# Local scratch: test output and contract-suite scratch copies
+test.txt
+test_out.txt
+test_result.txt
+head_contract.txt
+*.err
+
 # Editor / OS noise
 .vscode/
 .idea/

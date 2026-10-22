@@ -88,6 +88,23 @@ Lessons that cost the most time:
 - `src/dash/server.zig` uses a 100ms `poll` accept loop (not a self-connect
   wakeup). More deterministic; not the cause of any hang.
 
+## Dead ends — Redis and bench (do not re-derive)
+
+- **"RedisCommand" on every operation means a Redis older than 5.0.** The Lua
+  scripts call `redis.call('TIME')` and then write; before Redis 5.0
+  (effects replication) that is rejected. The server's message is now logged
+  and the version is checked at connect time, so this should not come up
+  again. If it does, look at the logged server message first.
+- **A bench that claims only a handful of jobs was connection contention, not
+  a slow broker.** A claim costs about ten times an enqueue, so on one shared
+  connection the producers starve the workers. The bench now gives each
+  worker its own connection. Do not "optimise" that back to a single
+  connection.
+- **The bench's `--rate` schedules the next slot from the moment the producer
+  actually enqueued.** A running total drifts ahead of the wall clock and
+  never becomes due, which is how the limiter used to enqueue nothing at all.
+  `rateDecision` is a pure function so this stays testable.
+
 ## Permanent CI Requirements (ALWAYS REMEMBER)
 
 1. **Contract suite must build and test on all three OSes** (macOS, Ubuntu, Windows) with both Postgres and Redis backends.
