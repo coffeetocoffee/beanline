@@ -435,6 +435,14 @@ primary Postgres. Design: no Streams consumer groups (rationale below); instead
 priority lists plus a delayed ZSET plus per-job lease keys, with one Lua script
 as the atomic claim primitive.
 
+**Minimum version: Redis 5.0.** The scripts read the server clock with
+`redis.call('TIME')` and then write. Before Redis 5.0 (effects replication) a
+script that called a non-deterministic command and then a write command was
+rejected outright, so Redis 3 and 4 fail every write path, not just some of
+them. Beanline reads `INFO server` at connect time and refuses an older
+server with a clear message, rather than letting every later operation fail
+with an opaque one.
+
 ### 7.1 Key layout (all keys namespaced, cluster-safe by hash tag `{q}`)
 
 ```

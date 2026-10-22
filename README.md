@@ -30,6 +30,12 @@ dashboard, the CLI, the bench harness, and the fuzz targets.
 
 Requires Zig 0.14.x.
 
+Requires Postgres 13+ or **Redis 5.0+**. The Redis floor is not arbitrary: the
+Lua scripts read the server clock and then write, which Redis only allows
+from 5.0 onwards (effects replication). Older servers fail every write path,
+and beanline now says so at connect time instead of failing later with an
+opaque error.
+
 ```sh
 zig build                 # binary in zig-out/bin
 zig build test            # unit + fuzz-target tests

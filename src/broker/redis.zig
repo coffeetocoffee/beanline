@@ -80,6 +80,34 @@ const Redis = struct {
     /// locking inside them would self-deadlock).
     mu: std.Thread.Mutex = .{},
 
+    /// Refuse to work against a Redis that cannot run the scripts.
+    ///
+    /// A server that is too old fails every write path with a Lua error that
+    /// says nothing about versions, which is a miserable thing to diagnose.
+    /// Checking once at connect turns that into one clear message. A server
+    /// that does not answer INFO at all (a restricted user, a proxy) is
+    /// allowed through: refusing to connect on a guess would be worse.
+    fn checkServerVersion(self: *Redis) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const v = self.c.command(arena.allocator(), &.{ "INFO", "server" }) catch return;
+        const text = switch (v) {
+            .bulk => |s| s orelse return,
+            .simple => |s| s,
+            else => return,
+        };
+        const line = findRedisVersion(text) orelse return;
+        const ver = Version.parse(line) orelse return;
+        if (ver.atLeast(min_version)) return;
+        std.log.err(
+            "redis: server version {s} is too old, beanline needs {s} or newer " ++
+                "(the Lua scripts read the server clock and then write, which " ++
+                "needs Redis 5.0 effects replication)",
+            .{ ver, min_version },
+        );
+        return error.RedisVersionTooOld;
+    }
+
     fn enqueueImpl(self: *Redis, kind: []const u8, args_json: []const u8, opts: b.EnqueueOptions, out: *b.Enqueued) !void {
         if (opts.unique == .replace) return error.UnsupportedUnique;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -776,6 +804,83 @@ pub const vtable = b.VTable{
     .queue_paused = queuePausedCb,
 };
 
+/// Copy the leading decimal digits of `s` into `buf` and return how many.
+fn leadingDigits(buf: []u8, s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') break;
+        if (n >= buf.len) break;
+        buf[n] = c;
+        n += 1;
+    }
+    return n;
+}
+
+/// Find the value of `redis_version:` in an INFO reply.
+fn findRedisVersion(info: []const u8) ?[]const u8 {
+    const key = "redis_version:";
+    var it = std.mem.splitScalar(u8, info, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (std.mem.startsWith(u8, line, key)) {
+            return std.mem.trim(u8, line[key.len..], " \r\t");
+        }
+    }
+    return null;
+}
+
+/// The minimum Redis version beanline supports.
+///
+/// The Lua scripts call `redis.call('TIME')` and then write. Before Redis
+/// 5.0 (effects replication) a script that called a non-deterministic
+/// command and then a write command was rejected outright, with
+/// "Write commands not allowed after non deterministic commands". Redis 3
+/// and 4 therefore fail every write path, not just some of them.
+pub const min_version = Version{ .major = 5, .minor = 0, .patch = 0 };
+
+pub const Version = struct {
+    major: u32 = 0,
+    minor: u32 = 0,
+    patch: u32 = 0,
+
+    /// Parse a `redis_version` string such as "7.4.11" or "5.0.14-alpine".
+    /// Returns null when the string is not a version at all, which is not an
+    /// error: a proxy or a fork may report something unexpected, and refusing
+    /// to connect on a guess would be worse than trying.
+    pub fn parse(s: []const u8) ?Version {
+        var it = std.mem.splitScalar(u8, s, '.');
+        const major_s = it.next() orelse return null;
+        const major = std.fmt.parseInt(u32, major_s, 10) catch return null;
+        var minor: u32 = 0;
+        var patch: u32 = 0;
+        if (it.next()) |minor_s| {
+            // Strip any pre-release or build suffix ("14-alpine", "0-rc1").
+            var buf: [16]u8 = undefined;
+            const n = leadingDigits(&buf, minor_s);
+            minor = std.fmt.parseInt(u32, buf[0..n], 10) catch 0;
+            if (it.next()) |patch_s| {
+                var pbuf: [16]u8 = undefined;
+                const pn = leadingDigits(&pbuf, patch_s);
+                patch = std.fmt.parseInt(u32, pbuf[0..pn], 10) catch 0;
+            }
+        }
+        return .{ .major = major, .minor = minor, .patch = patch };
+    }
+
+    /// True when this version is at least `other`.
+    pub fn atLeast(self: Version, other: Version) bool {
+        if (self.major != other.major) return self.major > other.major;
+        if (self.minor != other.minor) return self.minor > other.minor;
+        return self.patch >= other.patch;
+    }
+
+    pub fn format(self: Version, comptime f: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = f;
+        _ = options;
+        try writer.print("{d}.{d}.{d}", .{ self.major, self.minor, self.patch });
+    }
+};
+
 pub fn open(alloc: std.mem.Allocator, url_str: []const u8, aging_interval_ms: u64) !*Redis {
     const u = try Url.parse(alloc, url_str);
     defer u.free(alloc);
@@ -799,6 +904,8 @@ pub fn open(alloc: std.mem.Allocator, url_str: []const u8, aging_interval_ms: u6
         const v = try self.c.command(arena.allocator(), &.{ "SELECT", dbs });
         if (v != .simple) return error.Protocol;
     }
+
+    try self.checkServerVersion();
     return self;
 }
 
@@ -936,4 +1043,51 @@ test "live redis round trip" {
 
     try std.testing.expect(!br.capabilities().transactional_enqueue);
     try std.testing.expectEqualStrings("redis", br.capabilities().named_backend);
+}
+
+test "redis version parsing" {
+    const v = Version.parse("7.4.11").?;
+    try std.testing.expectEqual(@as(u32, 7), v.major);
+    try std.testing.expectEqual(@as(u32, 4), v.minor);
+    try std.testing.expectEqual(@as(u32, 11), v.patch);
+
+    const five = Version.parse("5.0.14").?;
+    try std.testing.expectEqual(@as(u32, 5), five.major);
+    try std.testing.expectEqual(@as(u32, 0), five.minor);
+
+    // A pre-release or vendor suffix must not break the parse.
+    const suffixed = Version.parse("7.2.4-alpine").?;
+    try std.testing.expectEqual(@as(u32, 7), suffixed.major);
+    try std.testing.expectEqual(@as(u32, 2), suffixed.minor);
+    try std.testing.expectEqual(@as(u32, 4), suffixed.patch);
+
+    // Not a version at all: the caller must not refuse to connect on a guess.
+    try std.testing.expect(Version.parse("unknown") == null);
+    try std.testing.expect(Version.parse("") == null);
+}
+
+test "redis version floor is 5.0" {
+    try std.testing.expect(Version.parse("5.0.0").?.atLeast(min_version));
+    try std.testing.expect(Version.parse("5.0.14").?.atLeast(min_version));
+    try std.testing.expect(Version.parse("6.2.0").?.atLeast(min_version));
+    try std.testing.expect(Version.parse("7.4.11").?.atLeast(min_version));
+    try std.testing.expect(Version.parse("8.10.2").?.atLeast(min_version));
+
+    // The versions that fail every write path.
+    try std.testing.expect(!Version.parse("3.0.504").?.atLeast(min_version));
+    try std.testing.expect(!Version.parse("4.0.9").?.atLeast(min_version));
+    try std.testing.expect(!Version.parse("2.8.24").?.atLeast(min_version));
+}
+
+test "redis version is read out of an info reply" {
+    const info =
+        "# Server\r\nredis_version:7.4.11\r\nredis_git_sha1:00000000\r\n" ++
+        "os:Windows\r\narch_bits:64\r\n";
+    try std.testing.expectEqualStrings("7.4.11", findRedisVersion(info).?);
+
+    const older =
+        "# Server\r\nredis_version:3.0.504\r\nos:Windows\r\n";
+    try std.testing.expectEqualStrings("3.0.504", findRedisVersion(older).?);
+
+    try std.testing.expect(findRedisVersion("# Server\r\nos:Windows\r\n") == null);
 }

@@ -12,6 +12,13 @@ planned and will use the same struct.
 | `BEANLINE_DATABASE_URL` | - | Postgres DSN. Setting it selects Postgres mode. |
 | `BEANLINE_REDIS_URL` | - | Redis URL. Setting it selects Redis mode. |
 
+### Backend requirements
+
+| Backend | Minimum | Why |
+|---|---|---|
+| Postgres | 13 | `SKIP LOCKED`, `GENERATED ALWAYS AS IDENTITY`, JSONB. |
+| Redis | **5.0** | The Lua scripts call `redis.call('TIME')` and then write. Before Redis 5.0 (effects replication) a script that called a non-deterministic command and then wrote was rejected outright, so every write path fails. Beanline checks the server version at connect time and refuses an older one with a clear message. |
+
 ## Queues and workers
 
 | Variable | Default | Meaning |

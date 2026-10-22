@@ -121,6 +121,7 @@ pub const Client = struct {
                 .simple => {},
                 .err => |e| {
                     self.last_error = e;
+                    std.log.err("redis: AUTH failed: {s}", .{e});
                     return error.AuthFailed;
                 },
                 else => return error.Protocol,
@@ -159,9 +160,24 @@ pub const Client = struct {
         const v = try parseReply(self.reader(), arena);
         if (v == .err) {
             self.last_error = v.err;
+            // The server's explanation is the only useful diagnostic here, and
+            // "RedisCommand" on its own is not. Log it where it happens, so
+            // it cannot be lost between the server and the operator.
+            std.log.err("redis: {s} failed: {s}", .{ commandName(args), v.err });
             return error.RedisCommand;
         }
         return v;
+    }
+
+    /// The message of the last error reply the server sent.
+    pub fn lastErrorMessage(self: *const Client) []const u8 {
+        return self.last_error;
+    }
+
+    /// The name of the command being sent, for diagnostics.
+    fn commandName(args: []const []const u8) []const u8 {
+        if (args.len == 0) return "?";
+        return args[0];
     }
 
     pub fn eval(
