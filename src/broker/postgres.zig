@@ -569,9 +569,7 @@ const Pg = struct {
                 const callback_args = try textCell(cb_row, 5); // callback_args is at index 5
                 if (callback_kind.len > 0) {
                     // Enqueue callback job with batch_id
-                    var cb_rows2 = try self.c.query(SQL_ENQUEUE_CALLBACK, &.{
-                        "default", callback_kind, callback_args, "{}", idstr
-                    });
+                    var cb_rows2 = try self.c.query(SQL_ENQUEUE_CALLBACK, &.{ "default", callback_kind, callback_args, "{}", idstr });
                     cb_rows2.deinit();
                 }
             }

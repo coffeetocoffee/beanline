@@ -751,12 +751,13 @@ fn createBatchImpl(self: *Redis, opts: b.BatchOptions, out: *b.BatchInfo) !void 
     var total_buf: [12]u8 = undefined;
     const total_str = try std.fmt.bufPrint(&total_buf, "{d}", .{opts.total});
     const cb_kind = opts.callback_kind orelse "";
-    _ = try self.c.command(al, &.{ "HMSET", key,
-        "total", total_str,
-        "remaining", total_str,
+    _ = try self.c.command(al, &.{
+        "HMSET",         key,
+        "total",         total_str,
+        "remaining",     total_str,
         "callback_kind", cb_kind,
         "callback_args", opts.callback_args,
-        "status", "open",
+        "status",        "open",
     });
     out.* = .{
         .id = id,
@@ -786,16 +787,17 @@ fn completeBatchJobImpl(self: *Redis, batch_id: i64, success: bool) !void {
             const job_id = try job_id_v.asInt();
             var ibuf: [24]u8 = undefined;
             const job_key = try std.fmt.allocPrint(al, "beanline:{{default}}:job:{d}", .{job_id});
-            _ = try self.c.command(al, &.{ "HMSET", job_key,
-                "kind", callback_kind,
-                "args", callback_args,
-                "priority", "1",
-                "run_at", "0",
-                "max_attempts", "25",
+            _ = try self.c.command(al, &.{
+                "HMSET",            job_key,
+                "kind",             callback_kind,
+                "args",             callback_args,
+                "priority",         "1",
+                "run_at",           "0",
+                "max_attempts",     "25",
                 "max_lease_losses", "3",
-                "status", "available",
-                "batch_id", try std.fmt.bufPrint(&ibuf, "{d}", .{batch_id}),
-                "inserted_at", try std.fmt.bufPrint(&ibuf, "{d}", .{std.time.milliTimestamp()}),
+                "status",           "available",
+                "batch_id",         try std.fmt.bufPrint(&ibuf, "{d}", .{batch_id}),
+                "inserted_at",      try std.fmt.bufPrint(&ibuf, "{d}", .{std.time.milliTimestamp()}),
             });
             _ = try self.c.command(al, &.{ "LPUSH", "beanline:{default}:ready:1", try std.fmt.bufPrint(&ibuf, "{d}", .{job_id}) });
             _ = try self.c.command(al, &.{ "HINCRBY", "beanline:{default}:depth", "available", "1" });

@@ -177,14 +177,10 @@ pub fn build(b: *std.Build) void {
     // Playwright E2E test setup (JavaScript/TypeScript)
     // Run with: zig build playwright-install && npx playwright test
     const playwright_step = b.step("playwright-install", "Install Playwright for E2E dashboard testing");
-    const playwright_install = b.addSystemCommand(&.{
-        "npx", "playwright", "install", "chromium"
-    });
+    const playwright_install = b.addSystemCommand(&.{ "npx", "playwright", "install", "chromium" });
     playwright_step.dependOn(&playwright_install.step);
 
     const playwright_test_step = b.step("playwright-test", "Run Playwright E2E tests against dashboard");
-    const playwright_test = b.addSystemCommand(&.{
-        "npx", "playwright", "test", "--project=chromium"
-    });
+    const playwright_test = b.addSystemCommand(&.{ "npx", "playwright", "test", "--project=chromium" });
     playwright_test_step.dependOn(&playwright_test.step);
 }

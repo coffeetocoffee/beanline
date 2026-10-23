@@ -119,7 +119,7 @@ fn runConcurrentClaimChaos(alloc: std.mem.Allocator) !void {
 
     for (threads) |t| t.join() catch {};
 
-    try stdout.print("PASSED ({d} jobs claimed by {d} workers)\n", .{done.load(.seq_cst), claimer_count});
+    try stdout.print("PASSED ({d} jobs claimed by {d} workers)\n", .{ done.load(.seq_cst), claimer_count });
 }
 
 fn claimWorker(args: struct {

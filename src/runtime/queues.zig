@@ -64,7 +64,7 @@ pub const Dispatch = struct {
     fn run(self: *Dispatch) void {
         const owner = self.owner;
         const sandbox_cfg = owner.sandbox_cfgs[self.queue_idx];
-        
+
         if (sandbox_cfg.enabled) {
             // Run in sandbox
             const input = sandbox_mod.SandboxInput{
@@ -86,7 +86,7 @@ pub const Dispatch = struct {
                 self.done.store(true, .release);
                 return;
             };
-            
+
             self.outcome = switch (sandbox_result.result) {
                 .ok => .ok,
                 .failed => .{ .failed = .{
@@ -101,7 +101,7 @@ pub const Dispatch = struct {
             self.done.store(true, .release);
             return;
         }
-        
+
         // Run in-process (no sandbox)
         var ctx = job_mod.Context{
             .job_id = self.id,
@@ -147,7 +147,7 @@ pub const Owner = struct {
     pub fn init(alloc: std.mem.Allocator, broker: Broker, reg: *Registry, pool: *pool_mod.Pool, opts: Options) !Owner {
         const lims = try alloc.alloc(limiter_mod.Limiter, opts.queues.len);
         for (opts.queues, 0..) |q, i| lims[i] = limiter_mod.Limiter.init(q.rate_per_s, 8, std.time.milliTimestamp());
-        
+
         // Build sandbox configs per queue
         var sandbox_cfgs = try alloc.alloc(sandbox_mod.SandboxConfig, opts.queues.len);
         for (opts.queues, 0..) |q, i| {
