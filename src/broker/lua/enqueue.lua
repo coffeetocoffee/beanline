@@ -6,6 +6,7 @@ local run_at = tonumber(ARGV[5])
 local maxa = ARGV[6]
 local uniq = ARGV[7]
 local dedup = ARGV[8]
+local batch_id = ARGV[9]  -- batch_id (optional)
 -- Get time from Redis server to avoid clock skew between workers
 local time_obj = redis.call('TIME')
 local now_ms = tonumber(time_obj[1]) * 1000 + math.floor(tonumber(time_obj[2]) / 1000)
@@ -56,7 +57,7 @@ redis.call('HSET', jk,
   'status', status, 'attempts', '0', 'max_attempts', maxa, 'epoch', '0',
   'lease_losses', '0', 'max_lease_losses', ARGV[10],
   'unique', uniq, 'dedup', dedup, 'run_at', tostring(run_at),
-  'context', ARGV[9], 'inserted_at', tostring(now_ms))
+  'context', ARGV[9], 'batch_id', batch_id, 'inserted_at', tostring(now_ms))
 if status == 'available' then
   redis.call('LPUSH', prefix .. ':ready:' .. prio, id)
 else

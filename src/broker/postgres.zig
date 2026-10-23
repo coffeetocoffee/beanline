@@ -3,24 +3,26 @@ const b = @import("broker.zig");
 const pg = @import("pg/conn.zig");
 
 const SQL_INSERT_UNIQUE =
-    \\INSERT INTO beanline_jobs (queue, kind, args, priority, run_at, max_attempts, max_lease_losses, unique_key, dedup_run_id, context, status)
+    \\INSERT INTO beanline_jobs (queue, kind, args, priority, run_at, max_attempts, max_lease_losses, unique_key, dedup_run_id, context, status, batch_id)
     \\VALUES ($1, $2, $3::jsonb, $4,
     \\  CASE WHEN $5::bigint = 0 THEN now() ELSE to_timestamp($5::bigint::double precision / 1000.0) END,
     \\  $6::int, $7::int, $8, $9, $10::jsonb,
     \\  CASE WHEN $5::bigint <> 0 AND to_timestamp($5::bigint::double precision / 1000.0) > now()
-    \\       THEN 'scheduled' ELSE 'available' END)
+    \\       THEN 'scheduled' ELSE 'available' END,
+    \\  $11)
     \\ON CONFLICT (queue, kind, unique_key) WHERE unique_key IS NOT NULL AND status NOT IN ('completed','discarded','cancelled','dead')
     \\DO NOTHING
     \\RETURNING id
 ;
 
 const SQL_INSERT_DEDUP =
-    \\INSERT INTO beanline_jobs (queue, kind, args, priority, run_at, max_attempts, max_lease_losses, unique_key, dedup_run_id, context, status)
+    \\INSERT INTO beanline_jobs (queue, kind, args, priority, run_at, max_attempts, max_lease_losses, unique_key, dedup_run_id, context, status, batch_id)
     \\VALUES ($1, $2, $3::jsonb, $4,
     \\  CASE WHEN $5::bigint = 0 THEN now() ELSE to_timestamp($5::bigint::double precision / 1000.0) END,
     \\  $6::int, $7::int, $8, $9, $10::jsonb,
     \\  CASE WHEN $5::bigint <> 0 AND to_timestamp($5::bigint::double precision / 1000.0) > now()
-    \\       THEN 'scheduled' ELSE 'available' END)
+    \\       THEN 'scheduled' ELSE 'available' END,
+    \\  $11)
     \\ON CONFLICT (kind, dedup_run_id) WHERE dedup_run_id IS NOT NULL
     \\DO NOTHING
     \\RETURNING id
@@ -49,6 +51,37 @@ const SQL_EVENT =
     \\SELECT $1, coalesce((SELECT max(seq) FROM beanline_job_events e2 WHERE e2.job_id = $1), 0) + 1, $2, $3::jsonb
 ;
 
+// Retention (§6.6). Completed rows are kept for `retention_completed_ms` and
+// their event trail for `retention_events_ms`, which is a *separate* budget
+// and typically shorter, so events of a still-live job are swept separately.
+// Bounded per statement (LIMIT) to keep lock hold time short: a wide queue's
+// completed rows are deleted over many sweeps rather than one big transaction.
+const SQL_RETENTION_JOBS =
+    \\DELETE FROM beanline_jobs
+    \\WHERE id IN (
+    \\  SELECT id FROM beanline_jobs
+    \\  WHERE status = 'completed'
+    \\    AND finished_at < now() - ($1::bigint * interval '1 millisecond')
+    \\  LIMIT 1000
+    \\)
+;
+// Events whose job is gone, or whose job finished before the event cutoff
+// window closed for the longer of the two budgets.
+const SQL_RETENTION_ORPHAN_EVENTS =
+    \\DELETE FROM beanline_job_events
+    \\WHERE job_id NOT IN (SELECT id FROM beanline_jobs)
+;
+
+const SQL_RETENTION_EVENTS =
+    \\DELETE FROM beanline_job_events
+    \\WHERE (job_id, seq) IN (
+    \\  SELECT job_id, seq FROM beanline_job_events
+    \\  WHERE at < now() - ($1::bigint * interval '1 millisecond')
+    \\    AND NOT EXISTS (SELECT 1 FROM beanline_jobs j WHERE j.id = beanline_job_events.job_id)
+    \\  LIMIT 1000
+    \\)
+;
+
 const SQL_CLAIM =
     \\WITH batch AS (
     \\  SELECT id FROM beanline_jobs
@@ -73,7 +106,8 @@ const SQL_CLAIM =
 
 const SQL_HB =
     \\UPDATE beanline_jobs SET lock_expires_at = now() + ($3::bigint * interval '1 millisecond')
-    \\WHERE id = ANY($1::bigint[]) AND lease_epoch = ANY($2::bigint[]) AND status = 'running'
+    \\WHERE (id, lease_epoch) IN (SELECT id, lease_epoch FROM unnest($1::bigint[], $2::bigint[]) AS t(id, lease_epoch))
+    \\  AND status = 'running'
 ;
 
 const SQL_FINISH =
@@ -155,6 +189,32 @@ const SQL_REAP =
     \\  lock_expires_at = NULL
     \\FROM upd u WHERE j.id = u.id
     \\RETURNING j.id, j.status, u.attempts_before, j.lease_losses
+;
+
+const SQL_CREATE_BATCH =
+    \\INSERT INTO beanline_batches (total, remaining, callback_kind, callback_args, status)
+    \\VALUES ($1, $1, $2, $3::jsonb, 'open')
+    \\RETURNING id, total, remaining, status
+;
+
+const SQL_COMPLETE_BATCH_JOB =
+    \\UPDATE beanline_batches SET remaining = remaining - 1
+    \\WHERE id = $1 AND status = 'open'
+    \\RETURNING id, total, remaining, status
+;
+
+const SQL_GET_BATCH =
+    \\SELECT id, total, remaining, status, callback_kind, callback_args FROM beanline_batches WHERE id = $1
+;
+
+const SQL_ENQUEUE_CALLBACK =
+    \\INSERT INTO beanline_jobs (queue, kind, args, priority, run_at, max_attempts, max_lease_losses, unique_key, dedup_run_id, context, status, batch_id)
+    \\SELECT $1, $2, $3::jsonb, 1, now(), 25, 3, NULL, NULL, $4::jsonb, 'available', $5
+    \\WHERE (SELECT remaining FROM beanline_batches WHERE id = $5) = 0
+;
+
+const SQL_UPDATE_BATCH_STATUS =
+    \\UPDATE beanline_batches SET status = 'done' WHERE id = $1 AND remaining = 0
 ;
 
 const SQL_DEPTH =
@@ -467,6 +527,62 @@ const Pg = struct {
         return n;
     }
 
+    fn createBatchImpl(self: *Pg, opts: b.BatchOptions, out: *b.BatchInfo) !void {
+        var total_buf: [12]u8 = undefined;
+        const total_str = try std.fmt.bufPrint(&total_buf, "{d}", .{opts.total});
+        const cb_kind = opts.callback_kind orelse "";
+        var rows = try self.c.query(SQL_CREATE_BATCH, &.{ total_str, cb_kind, opts.callback_args });
+        defer rows.deinit();
+        if (rows.rows.len == 0) return error.ProtocolViolation;
+        const row = rows.rows[0];
+        out.* = .{
+            .id = try Pg.intCell(i64, row, 0),
+            .total = try Pg.intCell(u32, row, 1),
+            .remaining = try Pg.intCell(u32, row, 2),
+            .status = try textCell(row, 3),
+        };
+    }
+
+    fn completeBatchJobImpl(self: *Pg, batch_id: i64, success: bool) !void {
+        _ = success;
+        var idbuf: [24]u8 = undefined;
+        const idstr = try std.fmt.bufPrint(&idbuf, "{d}", .{batch_id});
+
+        try self.c.execSimple("BEGIN");
+        errdefer self.rollback();
+
+        // Decrement remaining and check if batch is done
+        var rows = try self.c.query(SQL_COMPLETE_BATCH_JOB, &.{idstr});
+        defer rows.deinit();
+        if (rows.rows.len == 0) {
+            return;
+        }
+        const remaining = try Pg.intCell(u32, rows.rows[0], 2);
+
+        if (remaining == 0) {
+            // Batch complete - enqueue callback if specified
+            var cb_rows = try self.c.query(SQL_GET_BATCH, &.{idstr});
+            defer cb_rows.deinit();
+            if (cb_rows.rows.len > 0) {
+                const cb_row = cb_rows.rows[0];
+                const callback_kind = try textCell(cb_row, 4); // callback_kind is at index 4
+                const callback_args = try textCell(cb_row, 5); // callback_args is at index 5
+                if (callback_kind.len > 0) {
+                    // Enqueue callback job with batch_id
+                    var cb_rows2 = try self.c.query(SQL_ENQUEUE_CALLBACK, &.{
+                        "default", callback_kind, callback_args, "{}", idstr
+                    });
+                    cb_rows2.deinit();
+                }
+            }
+            // Update batch status to done
+            var up_rows = try self.c.query(SQL_UPDATE_BATCH_STATUS, &.{idstr});
+            up_rows.deinit();
+        }
+
+        try self.c.execSimple("COMMIT");
+    }
+
     fn depthImpl(self: *Pg, queue: []const u8, out: *b.Depth) !void {
         var rows = try self.c.query(SQL_DEPTH, &.{queue});
         defer rows.deinit();
@@ -538,6 +654,20 @@ fn reapCb(ctx: *anyopaque, queues: []const []const u8, limit: u32) anyerror!u32 
     self.mu.lock();
     defer self.mu.unlock();
     return try self.reapImpl(queues, limit);
+}
+
+fn createBatchCb(ctx: *anyopaque, opts: b.BatchOptions, out: *b.BatchInfo) anyerror!void {
+    const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    return try self.createBatchImpl(opts, out);
+}
+
+fn completeBatchJobCb(ctx: *anyopaque, batch_id: i64, success: bool) anyerror!void {
+    const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    return try self.completeBatchJobImpl(batch_id, success);
 }
 
 fn depthCb(ctx: *anyopaque, queue: []const u8, out: *b.Depth) anyerror!void {
@@ -885,12 +1015,13 @@ fn insertEventOnConn(alloc: std.mem.Allocator, c: *pg.Conn, job_id: i64, event_t
 
 fn enqueueCore(alloc: std.mem.Allocator, c: *pg.Conn, kind: []const u8, args_json: []const u8, opts: b.EnqueueOptions, out: *b.Enqueued) !void {
     if (opts.unique == .replace) return error.UnsupportedUnique;
-    var pbuf: [4][24]u8 = undefined;
+    var pbuf: [5][24]u8 = undefined;
     const pri = try std.fmt.bufPrint(&pbuf[0], "{d}", .{opts.priority});
     const rat = try std.fmt.bufPrint(&pbuf[1], "{d}", .{opts.run_at_ms});
     const ma = try std.fmt.bufPrint(&pbuf[2], "{d}", .{opts.max_attempts});
     const mll = try std.fmt.bufPrint(&pbuf[3], "{d}", .{opts.max_lease_losses});
-    const params = [_]?[]const u8{ opts.queue, kind, args_json, pri, rat, ma, mll, opts.unique_key, opts.dedup_run_id, opts.context_json };
+    const batch_id = if (opts.batch_id) |bid| try std.fmt.bufPrint(&pbuf[4], "{d}", .{bid}) else "";
+    const params = [_]?[]const u8{ opts.queue, kind, args_json, pri, rat, ma, mll, opts.unique_key, opts.dedup_run_id, opts.context_json, if (opts.batch_id) |_| batch_id else null };
 
     const deduped_sql = opts.dedup_run_id != null;
     const maybe_id: ?i64 = blk: {
@@ -952,6 +1083,52 @@ fn quoteJsonAlloc(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+/// One retention sweep: delete completed jobs finished before their cutoff and
+/// job events older than theirs, a bounded batch per statement so neither
+/// delete holds a long lock. Returns the number of completed rows deleted.
+fn retentionImpl(self: *Pg, alloc: std.mem.Allocator, completed_ms: i64, events_ms: i64) !u64 {
+    const p1 = try std.fmt.allocPrint(alloc, "{d}", .{completed_ms});
+    defer alloc.free(p1);
+    const p2 = try std.fmt.allocPrint(alloc, "{d}", .{events_ms});
+    defer alloc.free(p2);
+
+    var jobs_dropped: u64 = 0;
+    while (true) {
+        var rows = try self.c.query(SQL_RETENTION_JOBS, &.{p1});
+        defer rows.deinit();
+        const n = pg.Rows.rowCountFromTag(rows.command_tag) orelse 0;
+        jobs_dropped += n;
+        if (n == 0) break;
+    }
+
+    // Their events go with them (the cascade does this in the same statement
+    // above), so the orphan sweep only has to catch events left by rows the
+    // FK never guarded.
+    while (true) {
+        var rows = try self.c.query(SQL_RETENTION_ORPHAN_EVENTS, &.{});
+        defer rows.deinit();
+        const n = pg.Rows.rowCountFromTag(rows.command_tag) orelse 0;
+        if (n == 0) break;
+    }
+
+    // Events of jobs that are still live outlive the completed budget, so they
+    // get their own, typically shorter, window.
+    while (true) {
+        var rows = try self.c.query(SQL_RETENTION_EVENTS, &.{p2});
+        defer rows.deinit();
+        const n = pg.Rows.rowCountFromTag(rows.command_tag) orelse 0;
+        if (n == 0) break;
+    }
+    return jobs_dropped;
+}
+
+fn retentionCb(ctx: *anyopaque, alloc: std.mem.Allocator, completed_ms: i64, events_ms: i64) anyerror!u64 {
+    const self: *Pg = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    return retentionImpl(self, alloc, completed_ms, events_ms);
+}
+
 pub const vtable = b.VTable{
     .enqueue = enqueueCb,
     .claim = claimCb,
@@ -961,6 +1138,9 @@ pub const vtable = b.VTable{
     .cancel = cancelCb,
     .promote = promoteCb,
     .reap = reapCb,
+    .create_batch = createBatchCb,
+    .complete_batch_job = completeBatchJobCb,
+    .retention = retentionCb,
     .depth = depthCb,
     .capabilities = capabilitiesCb,
     .deinit = deinitCb,

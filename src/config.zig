@@ -29,6 +29,13 @@ pub const Config = struct {
     retention_completed_ms: i64 = 72 * 60 * 60 * 1000,
     retention_events_ms: i64 = 7 * 24 * 60 * 60 * 1000,
     aging_interval_ms: u64 = 5 * 60 * 1000,
+    /// Sandbox mode for handler isolation. Runs each handler in a separate
+    /// process with resource limits (memory, CPU, time). Windows uses job
+    /// objects; Unix uses fork/exec with rlimits.
+    sandbox_enabled: bool = false,
+    sandbox_memory_mb: u64 = 256,
+    sandbox_cpu_percent: u8 = 50,
+    sandbox_timeout_ms: u64 = 30_000,
     dashboard_bind: []const u8 = "127.0.0.1:9484",
     dashboard_enabled: bool = false,
     dashboard_auth_secret: []const u8 = "",
@@ -182,6 +189,10 @@ pub fn load() Config {
     c.retention_completed_ms = envNum(i64, "BEANLINE_RETENTION_COMPLETED_MS", 72 * 60 * 60 * 1000) catch 72 * 60 * 60 * 1000;
     c.retention_events_ms = envNum(i64, "BEANLINE_RETENTION_EVENTS_MS", 7 * 24 * 60 * 60 * 1000) catch 7 * 24 * 60 * 60 * 1000;
     c.aging_interval_ms = envNum(u64, "BEANLINE_AGING_INTERVAL_MS", 5 * 60 * 1000) catch 5 * 60 * 1000;
+    c.sandbox_enabled = envBool("BEANLINE_SANDBOX_ENABLED", false);
+    c.sandbox_memory_mb = envNum(u64, "BEANLINE_SANDBOX_MEMORY_MB", 256) catch 256;
+    c.sandbox_cpu_percent = @intCast(envNum(u32, "BEANLINE_SANDBOX_CPU_PERCENT", 50) catch 50);
+    c.sandbox_timeout_ms = envNum(u64, "BEANLINE_SANDBOX_TIMEOUT_MS", 30_000) catch 30_000;
 
     const bind = std.process.getEnvVarOwned(std.heap.page_allocator, "BEANLINE_DASH_BIND") catch null;
     if (bind) |b| c.dashboard_bind = b;

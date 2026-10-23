@@ -113,6 +113,7 @@ const Redis = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const al = arena.allocator();
+        const batch_id = if (opts.batch_id) |bid| try std.fmt.allocPrint(al, "{d}", .{bid}) else "";
         const argv = [_][]const u8{
             opts.queue,
             kind,
@@ -124,6 +125,7 @@ const Redis = struct {
             opts.dedup_run_id orelse "",
             opts.context_json,
             try std.fmt.allocPrint(al, "{d}", .{opts.max_lease_losses}),
+            batch_id,
         };
         const v = try self.c.eval(al, enqueue_lua, &.{}, &argv);
         const items = switch (v) {
@@ -739,6 +741,69 @@ fn queuePausedImpl(self: *Redis, queue: []const u8) !bool {
     return (try v.asInt()) != 0;
 }
 
+fn createBatchImpl(self: *Redis, opts: b.BatchOptions, out: *b.BatchInfo) !void {
+    var arena = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const batch_id = try self.c.command(al, &.{ "INCR", "beanline:batch:seq" });
+    const id = try batch_id.asInt();
+    const key = try std.fmt.allocPrint(al, "beanline:batch:{d}", .{id});
+    var total_buf: [12]u8 = undefined;
+    const total_str = try std.fmt.bufPrint(&total_buf, "{d}", .{opts.total});
+    const cb_kind = opts.callback_kind orelse "";
+    _ = try self.c.command(al, &.{ "HMSET", key,
+        "total", total_str,
+        "remaining", total_str,
+        "callback_kind", cb_kind,
+        "callback_args", opts.callback_args,
+        "status", "open",
+    });
+    out.* = .{
+        .id = id,
+        .total = opts.total,
+        .remaining = opts.total,
+        .status = "open",
+    };
+}
+
+fn completeBatchJobImpl(self: *Redis, batch_id: i64, success: bool) !void {
+    _ = success;
+    var arena = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const key = try std.fmt.allocPrint(al, "beanline:batch:{d}", .{batch_id});
+    const remaining_v = try self.c.command(al, &.{ "HINCRBY", key, "remaining", "-1" });
+    const remaining = try remaining_v.asInt();
+    if (remaining <= 0) {
+        // Batch complete - enqueue callback if specified
+        const cb_kind_v = try self.c.command(al, &.{ "HGET", key, "callback_kind" });
+        const callback_kind = if (cb_kind_v.bulk) |v| v else "";
+        if (callback_kind.len > 0) {
+            const cb_args_v = try self.c.command(al, &.{ "HGET", key, "callback_args" });
+            const callback_args = if (cb_args_v.bulk) |v| v else "{}";
+            // Enqueue callback job
+            const job_id_v = try self.c.command(al, &.{ "INCR", "beanline:seq" });
+            const job_id = try job_id_v.asInt();
+            var ibuf: [24]u8 = undefined;
+            const job_key = try std.fmt.allocPrint(al, "beanline:{{default}}:job:{d}", .{job_id});
+            _ = try self.c.command(al, &.{ "HMSET", job_key,
+                "kind", callback_kind,
+                "args", callback_args,
+                "priority", "1",
+                "run_at", "0",
+                "max_attempts", "25",
+                "max_lease_losses", "3",
+                "status", "available",
+                "batch_id", try std.fmt.bufPrint(&ibuf, "{d}", .{batch_id}),
+                "inserted_at", try std.fmt.bufPrint(&ibuf, "{d}", .{std.time.milliTimestamp()}),
+            });
+            _ = try self.c.command(al, &.{ "LPUSH", "beanline:{default}:ready:1", try std.fmt.bufPrint(&ibuf, "{d}", .{job_id}) });
+            _ = try self.c.command(al, &.{ "HINCRBY", "beanline:{default}:depth", "available", "1" });
+        }
+        _ = try self.c.command(al, &.{ "HSET", key, "status", "done" });
+    }
+}
+
 fn listJobsCb(ctx: *anyopaque, alloc: std.mem.Allocator, filter: b.JobFilter, out: *std.ArrayList(b.JobRow)) anyerror!void {
     const self: *Redis = @ptrCast(@alignCast(ctx));
     self.mu.lock();
@@ -802,6 +867,20 @@ fn queuePausedCb(ctx: *anyopaque, queue: []const u8) anyerror!bool {
     return queuePausedImpl(self, queue);
 }
 
+fn createBatchCb(ctx: *anyopaque, opts: b.BatchOptions, out: *b.BatchInfo) anyerror!void {
+    const self: *Redis = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    return createBatchImpl(self, opts, out);
+}
+
+fn completeBatchJobCb(ctx: *anyopaque, batch_id: i64, success: bool) anyerror!void {
+    const self: *Redis = @ptrCast(@alignCast(ctx));
+    self.mu.lock();
+    defer self.mu.unlock();
+    return completeBatchJobImpl(self, batch_id, success);
+}
+
 pub const vtable = b.VTable{
     .enqueue = enqueueCb,
     .claim = claimCb,
@@ -811,6 +890,8 @@ pub const vtable = b.VTable{
     .cancel = cancelCb,
     .promote = promoteCb,
     .reap = reapCb,
+    .create_batch = createBatchCb,
+    .complete_batch_job = completeBatchJobCb,
     .depth = depthCb,
     .capabilities = capabilitiesCb,
     .deinit = deinitCb,

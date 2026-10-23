@@ -40,6 +40,9 @@ pub const EnqueueOptions = struct {
     max_lease_losses: u32 = 3,
     unique_key: ?[]const u8 = null,
     dedup_run_id: ?[]const u8 = null,
+    /// Optional batch ID to associate this job with a batch. When all jobs
+    /// in a batch complete, the batch callback (if any) is enqueued.
+    batch_id: ?i64 = null,
     tags: []const []const u8 = &.{},
     context_json: []const u8 = "{}",
     unique: Unique = .block,
@@ -170,6 +173,24 @@ pub const EventRow = struct {
     at_ms: i64,
 };
 
+/// Batch creation options.
+pub const BatchOptions = struct {
+    /// Total number of jobs in this batch.
+    total: u32,
+    /// Optional callback kind to enqueue when the batch completes.
+    callback_kind: ?[]const u8 = null,
+    /// Optional callback arguments (JSON).
+    callback_args: []const u8 = "{}",
+};
+
+/// Batch information returned by createBatch.
+pub const BatchInfo = struct {
+    id: i64,
+    total: u32,
+    remaining: u32,
+    status: []const u8,
+};
+
 /// Query filters for job listing.
 pub const JobFilter = struct {
     queue: ?[]const u8 = null,
@@ -188,6 +209,16 @@ pub const VTable = struct {
     cancel: *const fn (ctx: *anyopaque, queue: []const u8, id: i64, lease_epoch: ?u64) anyerror!void,
     promote: *const fn (ctx: *anyopaque, queues: []const []const u8, limit: u32) anyerror!u32,
     reap: *const fn (ctx: *anyopaque, queues: []const []const u8, limit: u32) anyerror!u32,
+    /// Create a new batch record. Returns the batch ID.
+    create_batch: ?*const fn (ctx: *anyopaque, opts: BatchOptions, out: *BatchInfo) anyerror!void = null,
+    /// Notify the batch that a job has completed. Decrements remaining; when
+    /// it reaches 0, enqueues the callback (if any) and marks the batch done.
+    complete_batch_job: ?*const fn (ctx: *anyopaque, batch_id: i64, success: bool) anyerror!void = null,
+    /// Retention sweep. Deletes completed job rows older than
+    /// `retention_completed_ms` and job events older than
+    /// `retention_events_ms`, in bounded batches so the delete never holds a
+    /// long lock. `error.Unsupported` means the backend cannot express it.
+    retention: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, retention_completed_ms: i64, retention_events_ms: i64) anyerror!u64 = null,
     depth: *const fn (ctx: *anyopaque, queue: []const u8, out: *Depth) anyerror!void,
     capabilities: *const fn () Capabilities,
     deinit: *const fn (ctx: *anyopaque) void,
@@ -248,6 +279,26 @@ pub const Broker = struct {
 
     pub fn reap(self: Broker, queues: []const []const u8, limit: u32) anyerror!u32 {
         return self.vtable.reap(self.ptr, queues, limit);
+    }
+
+    /// Create a new batch record. Returns the batch info including the batch ID.
+    pub fn createBatch(self: Broker, opts: BatchOptions, out: *BatchInfo) anyerror!void {
+        const f = self.vtable.create_batch orelse return error.Unsupported;
+        return f(self.ptr, opts, out);
+    }
+
+    /// Notify the batch that a job has completed. Decrements remaining; when
+    /// it reaches 0, enqueues the callback (if any) and marks the batch done.
+    pub fn completeBatchJob(self: Broker, batch_id: i64, success: bool) anyerror!void {
+        const f = self.vtable.complete_batch_job orelse return error.Unsupported;
+        return f(self.ptr, batch_id, success);
+    }
+
+    /// Run one retention sweep. Returns the number of completed job rows
+    /// deleted, or `error.Unsupported` when this backend has no retention.
+    pub fn retention(self: Broker, alloc: std.mem.Allocator, retention_completed_ms: i64, retention_events_ms: i64) anyerror!u64 {
+        const f = self.vtable.retention orelse return error.Unsupported;
+        return f(self.ptr, alloc, retention_completed_ms, retention_events_ms);
     }
 
     pub fn depth(self: Broker, queue: []const u8, out: *Depth) anyerror!void {

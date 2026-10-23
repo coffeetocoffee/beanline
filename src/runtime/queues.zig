@@ -7,6 +7,7 @@ const metrics_mod = @import("../obs/metrics.zig");
 const limiter_mod = @import("limiter.zig");
 const fairness_mod = @import("fairness.zig");
 const job_mod = @import("../core/job.zig");
+const sandbox_mod = @import("sandbox.zig");
 
 const Broker = broker_mod.Broker;
 const Claimed = broker_mod.Claimed;
@@ -18,6 +19,11 @@ pub const QueueConfig = struct {
     weight: u32 = 1,
     rate_per_s: f64 = 0,
     lease_ms: u64 = 30_000,
+    /// Enable sandbox mode for this queue (runs handlers in isolated processes)
+    sandbox_enabled: bool = false,
+    sandbox_memory_mb: u64 = 256,
+    sandbox_cpu_percent: u8 = 50,
+    sandbox_timeout_ms: u64 = 30_000,
 };
 
 pub const Options = struct {
@@ -27,6 +33,11 @@ pub const Options = struct {
     retry: backoff_mod.Backoff = .{},
     /// Optional metrics sink for the duration and end-to-end histograms.
     metrics: ?*metrics_mod.Metrics = null,
+    /// Global sandbox settings (can be overridden per-queue)
+    sandbox_enabled: bool = false,
+    sandbox_memory_mb: u64 = 256,
+    sandbox_cpu_percent: u8 = 50,
+    sandbox_timeout_ms: u64 = 30_000,
 };
 
 // A claimed job handed to the pool. All bookkeeping happens on the runtime
@@ -52,6 +63,46 @@ pub const Dispatch = struct {
 
     fn run(self: *Dispatch) void {
         const owner = self.owner;
+        const sandbox_cfg = owner.sandbox_cfgs[self.queue_idx];
+        
+        if (sandbox_cfg.enabled) {
+            // Run in sandbox
+            const input = sandbox_mod.SandboxInput{
+                .job_id = self.id,
+                .lease_epoch = self.epoch,
+                .attempt = @intCast(@min(self.attempts, 255)),
+                .kind_name = self.kind,
+                .args_json = self.args_json,
+                .deadline_ms = self.deadline_ms,
+            };
+            const sandbox_result = sandbox_mod.runSandboxed(
+                owner.alloc,
+                sandbox_cfg,
+                input,
+                self.entry.runner,
+            ) catch |e| {
+                std.log.warn("sandbox error id={d}: {s}", .{ self.id, @errorName(e) });
+                self.outcome = .{ .failed = .{ .class = .dead, .name = "SandboxError" } };
+                self.done.store(true, .release);
+                return;
+            };
+            
+            self.outcome = switch (sandbox_result.result) {
+                .ok => .ok,
+                .failed => .{ .failed = .{
+                    .class = if (sandbox_result.error_class.? == 0) .retryable else .dead,
+                    .name = if (sandbox_result.error_name) |n| n else "SandboxError",
+                } },
+                .timeout => .{ .failed = .{ .class = .dead, .name = "SandboxTimeout" } },
+                .oom => .{ .failed = .{ .class = .dead, .name = "SandboxOOM" } },
+                .killed => .{ .failed = .{ .class = .dead, .name = "SandboxKilled" } },
+            };
+            self.was_stopped = false;
+            self.done.store(true, .release);
+            return;
+        }
+        
+        // Run in-process (no sandbox)
         var ctx = job_mod.Context{
             .job_id = self.id,
             .lease_epoch = self.epoch,
@@ -90,10 +141,24 @@ pub const Owner = struct {
     default_retry: backoff_mod.Backoff,
     items: [64]Claimed = undefined,
     metrics: ?*metrics_mod.Metrics,
+    /// Sandbox config (per-queue, with global fallback)
+    sandbox_cfgs: []sandbox_mod.SandboxConfig,
 
     pub fn init(alloc: std.mem.Allocator, broker: Broker, reg: *Registry, pool: *pool_mod.Pool, opts: Options) !Owner {
         const lims = try alloc.alloc(limiter_mod.Limiter, opts.queues.len);
         for (opts.queues, 0..) |q, i| lims[i] = limiter_mod.Limiter.init(q.rate_per_s, 8, std.time.milliTimestamp());
+        
+        // Build sandbox configs per queue
+        var sandbox_cfgs = try alloc.alloc(sandbox_mod.SandboxConfig, opts.queues.len);
+        for (opts.queues, 0..) |q, i| {
+            sandbox_cfgs[i] = .{
+                .enabled = opts.sandbox_enabled or q.sandbox_enabled,
+                .memory_mb = if (q.sandbox_memory_mb != 0) q.sandbox_memory_mb else opts.sandbox_memory_mb,
+                .cpu_percent = if (q.sandbox_cpu_percent != 0) q.sandbox_cpu_percent else opts.sandbox_cpu_percent,
+                .timeout_ms = if (q.sandbox_timeout_ms != 0) q.sandbox_timeout_ms else opts.sandbox_timeout_ms,
+            };
+        }
+
         var self = Owner{
             .alloc = alloc,
             .broker = broker,
@@ -104,6 +169,7 @@ pub const Owner = struct {
             .default_retry = opts.retry,
             .limiters = lims,
             .metrics = opts.metrics,
+            .sandbox_cfgs = sandbox_cfgs,
         };
         var weights: [fairness_mod.MAX_QUEUES]u32 = [_]u32{1} ** fairness_mod.MAX_QUEUES;
         for (opts.queues, 0..) |q, i| if (q.weight != 0) {
@@ -115,6 +181,7 @@ pub const Owner = struct {
 
     pub fn deinit(self: *Owner) void {
         self.alloc.free(self.limiters);
+        self.alloc.free(self.sandbox_cfgs);
         self.free_slots.deinit(self.alloc);
         self.running.deinit(self.alloc);
     }
@@ -385,6 +452,7 @@ test "fairness pick with refreshed slots" {
         .worker_name = "",
         .default_retry = .{},
         .metrics = null,
+        .sandbox_cfgs = &.{},
     };
     o.fair.setWeights(&[_]u32{ 1, 1 });
     var flags = [_]bool{ true, false };

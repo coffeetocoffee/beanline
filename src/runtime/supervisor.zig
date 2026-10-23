@@ -207,6 +207,10 @@ pub const App = struct {
             .worker_name = "beanline",
             .retry = self.cfg.defaultBackoff(),
             .metrics = &self.metrics,
+            .sandbox_enabled = self.cfg.sandbox_enabled,
+            .sandbox_memory_mb = self.cfg.sandbox_memory_mb,
+            .sandbox_cpu_percent = self.cfg.sandbox_cpu_percent,
+            .sandbox_timeout_ms = self.cfg.sandbox_timeout_ms,
         });
         defer owner.deinit();
 
@@ -241,6 +245,8 @@ pub const App = struct {
         self.log.info("worker: beanline worker running backend={s} (ctrl+c to stop)", .{br.capabilities().named_backend});
 
         var depth_tick_ms: i64 = 0;
+        var retention_tick_ms: i64 = 0;
+        const retention_interval_ms: i64 = 60 * 60 * 1000; // 1 hour
         while (!g_stop.load(.seq_cst)) {
             if (owner.inflight() == 0 and g_stop.load(.seq_cst)) break;
             const t0 = std.time.microTimestamp();
@@ -267,6 +273,13 @@ pub const App = struct {
                 }
             }
             std.time.sleep(if (owner.inflight() == 0) 20 else 5);
+            // periodic retention sweep (bounded, cheap)
+            if (now_ms - retention_tick_ms > retention_interval_ms) {
+                retention_tick_ms = now_ms;
+                _ = br.retention(self.alloc, self.cfg.retention_completed_ms, self.cfg.retention_events_ms) catch |e| {
+                    self.log.warn("retention sweep: {s}", .{@errorName(e)});
+                };
+            }
         }
 
         // Graceful drain: stop claiming, wait for running handlers.

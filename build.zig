@@ -4,35 +4,48 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Sanitizer options
+    const sanitize_address = b.option(bool, "sanitize-address", "Enable AddressSanitizer") orelse false;
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
+
     // One module so tests (library + fuzz targets) can import the public
     // surface without reaching outside their own module path.
-    const beanline_mod = b.addModule("beanline", .{
+    var beanline_mod = b.addModule("beanline", .{
         .root_source_file = b.path("src/beanline.zig"),
         .target = target,
         .optimize = optimize,
     });
+    if (sanitize_address) beanline_mod.sanitize_c = true;
+    if (sanitize_thread) beanline_mod.sanitize_thread = true;
+    // Note: MemorySanitizer and UBSan not directly supported in Zig 0.14.1 Module
     // The fuzz exes get their own copy of the library compiled in ReleaseSafe
     // so the memory checks that catch bugs are actually enabled.
-    const beanline_fuzz_mod = b.addModule("beanline-fuzz", .{
+    var beanline_fuzz_mod = b.addModule("beanline-fuzz", .{
         .root_source_file = b.path("src/beanline.zig"),
         .target = target,
         .optimize = .ReleaseSafe,
     });
+    if (sanitize_address) beanline_fuzz_mod.sanitize_c = true;
+    if (sanitize_thread) beanline_fuzz_mod.sanitize_thread = true;
 
-    const exe = b.addExecutable(.{
+    var exe = b.addExecutable(.{
         .name = "beanline",
         .root_source_file = b.path("src/beanline.zig"),
         .target = target,
         .optimize = optimize,
     });
+    if (sanitize_address) exe.root_module.sanitize_c = true;
+    if (sanitize_thread) exe.root_module.sanitize_thread = true;
     b.installArtifact(exe);
 
-    const lib = b.addStaticLibrary(.{
+    var lib = b.addStaticLibrary(.{
         .name = "beanline",
         .root_source_file = b.path("src/beanline.zig"),
         .target = target,
         .optimize = optimize,
     });
+    if (sanitize_address) lib.root_module.sanitize_c = true;
+    if (sanitize_thread) lib.root_module.sanitize_thread = true;
     b.installArtifact(lib);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -142,4 +155,36 @@ pub fn build(b: *std.Build) void {
     const install_contract_tests = b.addInstallArtifact(contract_tests, .{});
     const contract_test_install_step = b.step("test-contract-install", "Install the contract test binary for direct runs");
     contract_test_install_step.dependOn(&install_contract_tests.step);
+
+    // Chaos test suite: fault injection, resource exhaustion, concurrent stress
+    const chaos_mod = b.createModule(.{
+        .root_source_file = b.path("tests/chaos/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    chaos_mod.addImport("beanline", beanline_mod);
+    const chaos_tests = b.addTest(.{
+        .root_module = chaos_mod,
+        .name = "test-chaos",
+    });
+    const run_chaos_tests = b.addRunArtifact(chaos_tests);
+    const chaos_test_step = b.step("test-chaos", "Run chaos fault-injection tests (requires BEANLINE_TEST_DSN)");
+    chaos_test_step.dependOn(&run_chaos_tests.step);
+    const install_chaos_tests = b.addInstallArtifact(chaos_tests, .{});
+    const chaos_test_install_step = b.step("test-chaos-install", "Install the chaos test binary for direct runs");
+    chaos_test_install_step.dependOn(&install_chaos_tests.step);
+
+    // Playwright E2E test setup (JavaScript/TypeScript)
+    // Run with: zig build playwright-install && npx playwright test
+    const playwright_step = b.step("playwright-install", "Install Playwright for E2E dashboard testing");
+    const playwright_install = b.addSystemCommand(&.{
+        "npx", "playwright", "install", "chromium"
+    });
+    playwright_step.dependOn(&playwright_install.step);
+
+    const playwright_test_step = b.step("playwright-test", "Run Playwright E2E tests against dashboard");
+    const playwright_test = b.addSystemCommand(&.{
+        "npx", "playwright", "test", "--project=chromium"
+    });
+    playwright_test_step.dependOn(&playwright_test.step);
 }
